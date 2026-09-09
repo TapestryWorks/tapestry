@@ -17,6 +17,49 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 
 ```bash
 cargo test --workspace
+cargo test -p tapestry-core --features genai
+```
+
+### Multi-provider models (genai)
+
+The `genai` feature on `tapestry-core` adds a unified adapter for OpenAI, Anthropic,
+Gemini, xAI, Groq, DeepSeek, Ollama, and other providers supported by
+[`genai`](https://crates.io/crates/genai) 0.6.
+
+Build with the feature:
+
+```bash
+cargo build -p tapestry-core --features genai
+```
+
+**Model naming** — either form works:
+
+- Simple name (adapter inferred): `gpt-4o-mini`, `claude-sonnet-4-20250514`
+- Namespaced: `openai::gpt-4o-mini`, `ollama::llama3.2`, `groq::llama-3.3-70b-versatile`
+
+**Configuration** — genai reads standard provider env vars by default (for example
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`). Local Ollama needs no key;
+optionally set `OLLAMA_HOST` (default `http://127.0.0.1:11434`).
+
+Explicit configuration (no hard-coded secrets):
+
+```rust
+use tapestry_core::{GenaiChatService, GenaiProviderConfig, GenaiModelClient};
+
+let service = GenaiChatService::from_config(
+    &GenaiProviderConfig::new("gpt-4o-mini")
+        .with_api_key_env("OPENAI_API_KEY"), // or .with_api_key(...) for tests
+)?;
+let turn = service.chat_simple(Some("You are helpful."), "Hello!").await?;
+
+// Or plug into the agent loop via ModelClient:
+let model = GenaiModelClient::from_model("ollama::llama3.2")?;
+```
+
+Run the multi-provider example (skips providers whose env vars are missing):
+
+```bash
+cargo run -p tapestry-core --features genai --example genai_multi_provider
 ```
 
 Minimal programmatic usage:
