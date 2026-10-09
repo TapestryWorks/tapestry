@@ -11,6 +11,20 @@ repository.workspace = true
 name = "minimal_turn"
 path = "examples/minimal_turn.rs"
 
+[[example]]
+name = "genai_multi_provider"
+path = "examples/genai_multi_provider.rs"
+required-features = ["genai"]
+
+[[test]]
+name = "genai_integration"
+path = "tests/genai_integration.rs"
+required-features = ["genai"]
+
+[features]
+default = []
+genai = ["dep:genai"]
+
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +35,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 tapestry-protocol = { workspace = true }
+genai = { workspace = true, optional = true }
 
 [dev-dependencies]
+genai = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

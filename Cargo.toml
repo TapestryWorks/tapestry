@@ -19,3 +19,4 @@ async-trait = "0.1"
 tracing = "0.1"
 
 tapestry-protocol = { path = "crates/tapestry-protocol" }
+genai = "0.6"
