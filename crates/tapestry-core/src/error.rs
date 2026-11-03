@@ -12,12 +12,14 @@ pub enum CoreError {
     NoTurnInProgress,
     #[error("model error: {0}")]
     Model(String),
-    #[error("tool error: {0}")]
-    Tool(String),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
     #[error("channel closed")]
     ChannelClosed,
-    #[error("max tool iterations ({0}) exceeded")]
-    MaxToolIterations(u32),
+    #[error("tool error: {0}")]
+    Tool(String),
+    #[error("internal state error: {0}")]
+    Internal(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }

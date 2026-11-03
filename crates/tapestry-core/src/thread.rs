@@ -5,16 +5,41 @@ use tracing::{debug, warn};
 
 use tapestry_protocol::{
     ErrorEvent, Event, EventMsg, Op, SessionConfiguredEvent, Submission, SubmissionId, ThreadId,
-    TurnAbortedEvent, TurnId,
+    TurnAbortReason, TurnAbortedEvent, TurnId,
 };
 
-use crate::agent::AgentLoop;
+use crate::agent::{AgentLoop, UserInput};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
+use crate::history::HistoryItem;
 use crate::model::ModelClient;
 use crate::tool::ToolRegistry;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+
+/// Per-thread session state owned by the worker task.
+#[derive(Default)]
+struct Session {
+    config: ThreadConfig,
+    configured: bool,
+    active_turn: Option<TurnId>,
+    /// Kept across turns; in-memory only and unbounded.
+    history: Vec<HistoryItem>,
+}
+
+fn validate_user_name(name: &str) -> Result<(), CoreError> {
+    if name.trim().is_empty() {
+        return Err(CoreError::InvalidInput(
+            "user_name must not be empty".into(),
+        ));
+    }
+    if name.contains(['\n', '\r']) {
+        return Err(CoreError::InvalidInput(
+            "user_name must not contain line breaks".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Handle for submitting operations and receiving events from a thread.
 #[derive(Clone)]
@@ -108,25 +133,15 @@ async fn run_thread_loop(
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
 ) -> Result<(), CoreError> {
-    let mut config = ThreadConfig::default();
+    let mut session = Session::default();
     let agent = AgentLoop::new(model, tools);
-    let mut active_turn: Option<TurnId> = None;
-    let mut configured = false;
 
     while let Some(submission) = submission_rx.recv().await {
         debug!(submission_id = %submission.id, "processing submission");
 
         let submission_id = submission.id;
-        let result = process_submission(
-            &agent,
-            thread_id,
-            &mut config,
-            &mut configured,
-            &mut active_turn,
-            submission,
-            &event_tx,
-        )
-        .await;
+        let result =
+            process_submission(&agent, thread_id, &mut session, submission, &event_tx).await;
 
         if let Err(err) = result {
             let _ = event_tx
@@ -146,9 +161,7 @@ async fn run_thread_loop(
 async fn process_submission(
     agent: &AgentLoop,
     thread_id: ThreadId,
-    config: &mut ThreadConfig,
-    configured: &mut bool,
-    active_turn: &mut Option<TurnId>,
+    session: &mut Session,
     submission: Submission,
     event_tx: &mpsc::Sender<Event>,
 ) -> Result<(), CoreError> {
@@ -157,9 +170,9 @@ async fn process_submission(
             model,
             system_prompt,
         } => {
-            config.model = model.clone();
-            config.system_prompt = system_prompt;
-            *configured = true;
+            session.config.model = model.clone();
+            session.config.system_prompt = system_prompt;
+            session.configured = true;
             event_tx
                 .send(Event::new(
                     submission.id,
@@ -169,15 +182,15 @@ async fn process_submission(
                 .map_err(|_| CoreError::ChannelClosed)?;
         }
         Op::ThreadSettings { settings } => {
-            config.apply_settings(&settings);
-            if !*configured {
-                *configured = true;
+            session.config.apply_settings(&settings);
+            if !session.configured {
+                session.configured = true;
                 event_tx
                     .send(Event::new(
                         submission.id,
                         EventMsg::SessionConfigured(SessionConfiguredEvent {
                             thread_id,
-                            model: config.model.clone(),
+                            model: session.config.model.clone(),
                         }),
                     ))
                     .await
@@ -185,13 +198,14 @@ async fn process_submission(
             }
         }
         Op::Interrupt => {
-            let aborted = active_turn.take();
+            let aborted = session.active_turn.take();
             event_tx
                 .send(Event::new(
                     submission.id,
                     EventMsg::TurnAborted(TurnAbortedEvent {
                         turn_id: aborted,
-                        reason: "interrupted by client".into(),
+                        reason: TurnAbortReason::Interrupted,
+                        message: Some("interrupted by client".into()),
                     }),
                 ))
                 .await
@@ -200,22 +214,36 @@ async fn process_submission(
         Op::StartTurn {
             user_message,
             turn_id,
+            user_name,
         } => {
-            if !*configured {
+            if !session.configured {
                 return Err(CoreError::NotConfigured);
             }
-            if active_turn.is_some() {
+            if session.active_turn.is_some() {
                 return Err(CoreError::TurnInProgress);
+            }
+            if let Some(name) = &user_name {
+                validate_user_name(name)?;
             }
 
             let turn_id = turn_id.unwrap_or_else(TurnId::new);
-            *active_turn = Some(turn_id);
+            session.active_turn = Some(turn_id);
 
             let run_result = agent
-                .run_turn(submission.id, turn_id, user_message, config, event_tx)
+                .run_turn(
+                    submission.id,
+                    turn_id,
+                    UserInput {
+                        content: user_message,
+                        name: user_name,
+                    },
+                    &mut session.history,
+                    &session.config,
+                    event_tx,
+                )
                 .await;
 
-            active_turn.take();
+            session.active_turn.take();
             run_result?;
         }
     }
@@ -261,6 +289,7 @@ mod tests {
             .submit(Op::StartTurn {
                 user_message: "hello".into(),
                 turn_id: None,
+                user_name: None,
             })
             .await
             .unwrap();
@@ -282,6 +311,7 @@ mod tests {
             .submit(Op::StartTurn {
                 user_message: "hello".into(),
                 turn_id: None,
+                user_name: None,
             })
             .await
             .unwrap();
@@ -290,5 +320,136 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let events = handle.collect_events_for(turn_id).await;
         assert!(events.iter().any(|e| matches!(e.msg, EventMsg::Error(_))));
+    }
+
+    async fn configure(handle: &ThreadHandle) {
+        let id = handle
+            .submit(Op::Configure {
+                model: "mock-model".into(),
+                system_prompt: None,
+            })
+            .await
+            .unwrap();
+        handle.collect_events_for(id).await;
+    }
+
+    async fn turn(handle: &ThreadHandle, msg: &str, user_name: Option<&str>) -> Vec<Event> {
+        let id = handle
+            .submit(Op::StartTurn {
+                user_message: msg.into(),
+                turn_id: None,
+                user_name: user_name.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        handle.collect_events_for(id).await
+    }
+
+    fn agent_text(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match &e.msg {
+                EventMsg::AgentMessage(m) => Some(m.content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Echoes the number of history items it sees.
+    struct HistoryCountModel;
+
+    #[async_trait::async_trait]
+    impl ModelClient for HistoryCountModel {
+        async fn complete(
+            &self,
+            request: crate::model::ModelRequest,
+        ) -> Result<crate::model::ModelResponse, CoreError> {
+            Ok(crate::model::ModelResponse {
+                content: Some(format!("items={}", request.history.len())),
+                tool_calls: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn history_persists_across_turns() {
+        let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
+        configure(&handle).await;
+        assert_eq!(agent_text(&turn(&handle, "one", None).await), "items=1");
+        // user, assistant, user
+        assert_eq!(agent_text(&turn(&handle, "two", None).await), "items=3");
+    }
+
+    #[tokio::test]
+    async fn named_user_is_rendered_for_model() {
+        let (_t, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
+        configure(&handle).await;
+        let events = turn(&handle, "hi", Some("alice")).await;
+        assert_eq!(agent_text(&events), "Echo: alice: hi");
+    }
+
+    #[tokio::test]
+    async fn invalid_user_name_errors_and_leaves_history() {
+        let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
+        configure(&handle).await;
+        for bad in ["", "   ", "a\nb"] {
+            let events = turn(&handle, "hi", Some(bad)).await;
+            assert!(
+                matches!(events.last().unwrap().msg, EventMsg::Error(_)),
+                "{bad:?}"
+            );
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e.msg, EventMsg::TurnStarted(_))));
+        }
+        assert_eq!(agent_text(&turn(&handle, "ok", None).await), "items=1");
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_enum_reason() {
+        let (_t, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
+        let id = handle.submit(Op::Interrupt).await.unwrap();
+        let events = handle.collect_events_for(id).await;
+        match &events.last().unwrap().msg {
+            EventMsg::TurnAborted(a) => assert_eq!(a.reason, TurnAbortReason::Interrupted),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_name_setting_updates_system_prompt() {
+        struct PromptModel;
+        #[async_trait::async_trait]
+        impl ModelClient for PromptModel {
+            async fn complete(
+                &self,
+                request: crate::model::ModelRequest,
+            ) -> Result<crate::model::ModelResponse, CoreError> {
+                Ok(crate::model::ModelResponse {
+                    content: request.system_prompt,
+                    tool_calls: vec![],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                })
+            }
+        }
+
+        let (_t, handle) = TapestryThread::spawn(Arc::new(PromptModel), test_tools());
+        configure(&handle).await;
+        assert_eq!(agent_text(&turn(&handle, "x", None).await), "");
+
+        handle
+            .submit(Op::ThreadSettings {
+                settings: tapestry_protocol::ThreadSettings {
+                    agent_name: Some("planner".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let text = agent_text(&turn(&handle, "x", None).await);
+        assert!(text.contains("planner"));
     }
 }

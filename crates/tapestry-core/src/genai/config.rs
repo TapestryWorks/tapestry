@@ -96,6 +96,16 @@ pub fn default_api_key_env(model: &str) -> Option<&'static str> {
     adapter.and_then(|kind| kind.default_key_env_name())
 }
 
+/// genai appends relative paths to the base URL, so it must end with `/`.
+fn normalize_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
 /// Build a configured [`Client`] from explicit settings and genai defaults.
 pub fn build_client(config: &GenaiProviderConfig) -> Result<Client, CoreError> {
     let mut builder = Client::builder();
@@ -119,7 +129,7 @@ pub fn build_client(config: &GenaiProviderConfig) -> Result<Client, CoreError> {
     }
 
     if let Some(endpoint) = &config.endpoint {
-        let endpoint = Endpoint::from_owned(endpoint.clone());
+        let endpoint = Endpoint::from_owned(normalize_endpoint(endpoint));
         builder = builder.with_service_target_resolver_fn(move |mut target: ServiceTarget| {
             target.endpoint = endpoint.clone();
             Ok(target)
@@ -166,6 +176,18 @@ mod tests {
         assert_eq!(
             default_api_key_env("groq::llama-3.3-70b-versatile"),
             Some("GROQ_API_KEY")
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_adds_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/"
+        );
+        assert_eq!(
+            normalize_endpoint(" http://127.0.0.1:11434/ "),
+            "http://127.0.0.1:11434/"
         );
     }
 

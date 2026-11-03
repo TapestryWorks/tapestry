@@ -26,7 +26,7 @@ async fn ollama_live_chat() {
 
     let endpoint = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let service = GenaiChatService::from_config(
-        &GenaiProviderConfig::new("ollama::llama3.2")
+        &GenaiProviderConfig::new("qwen3.5:4b-mlx")
             .with_adapter(AdapterKind::Ollama)
             .with_endpoint(endpoint),
     )

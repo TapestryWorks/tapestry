@@ -26,6 +26,7 @@ async fn main() {
         .submit(Op::StartTurn {
             user_message: "hello tapestry".into(),
             turn_id: None,
+            user_name: None,
         })
         .await
         .expect("start turn");
@@ -33,7 +34,9 @@ async fn main() {
     for event in handle.collect_events_for(turn_id).await {
         match event.msg {
             EventMsg::AgentMessage(msg) => println!("agent: {}", msg.content),
-            EventMsg::TurnComplete(_) => println!("turn complete"),
+            EventMsg::TurnComplete(done) => {
+                println!("turn complete ({:?})", done.finish_reason)
+            }
             other => println!("event: {other:?}"),
         }
     }

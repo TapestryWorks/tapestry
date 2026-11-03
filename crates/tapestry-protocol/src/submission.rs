@@ -41,6 +41,9 @@ pub enum Op {
         user_message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
+        /// Speaker name for multi-agent scenarios.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_name: Option<String>,
     },
     /// Abort the in-flight turn without shutting down the thread.
     Interrupt,
@@ -60,11 +63,26 @@ mod tests {
             Op::StartTurn {
                 user_message: "hello".into(),
                 turn_id: None,
+                user_name: Some("alice".into()),
             },
         );
         let json = serde_json::to_string(&submission).unwrap();
         let decoded: Submission = serde_json::from_str(&json).unwrap();
         assert_eq!(submission, decoded);
+    }
+
+    #[test]
+    fn start_turn_without_user_name_is_omitted_and_parses() {
+        let op = Op::StartTurn {
+            user_message: "hi".into(),
+            turn_id: None,
+            user_name: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(!json.contains("user_name"));
+        let decoded: Op =
+            serde_json::from_str(r#"{"type":"start_turn","user_message":"hi"}"#).unwrap();
+        assert_eq!(op, decoded);
     }
 
     #[test]
