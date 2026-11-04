@@ -70,6 +70,18 @@ The thread session owns a `Vec<HistoryItem>` (`User{name}`, `Assistant{content, 
 - Assistant items never carry a name. The agent's own name (`ThreadSettings.agent_name`) is appended to the system prompt as `Your name is {name}.`
 - Known limit: user content can imitate the `name:` prefix.
 
+### Time context
+
+Models have no clock, so `run_turn` appends a nameless `User` history entry before the turn's user message when the date or time zone changed since the last send (design follows Codex `<environment_context>`):
+
+- The session holds a `ContextState` (`Unsent` / `Sent{date, timezone}` / `Unavailable`). Only changed fields are rendered (`<current_date>`, `<timezone>`); same-day turns send nothing. Detection happens once per turn, not per model call.
+- Time comes from an injected `Arc<dyn Clock>` (`SystemClock` by default: local date plus IANA zone, falling back to a UTC offset; `FixedClock` for tests).
+- `ThreadSettings.include_time_context` (default on) disables it. Disabling after a send, or a clock failure, appends `<current_date status="unavailable" />` once; a clock failure never fails the turn. Recovery re-sends the full context.
+- It differs from the transient `reminder`: this entry is persisted in history, the reminder only exists in a single request clone.
+- No new `HistoryItem` variant, timestamp field, or event; event order is unchanged.
+- Any wholesale rewrite of history (compaction, rollback, restore) MUST go through `Session::replace_history`, which resets the state to `Unsent` so the next turn re-sends in full.
+- Future persistence: timestamps belong in the storage envelope, not on items; save `ContextState` as its own entry and take the last one as the baseline on load (missing means `Unsent`). Never derive the baseline from envelope timestamps; skip unknown entry types.
+
 ### Event order
 
 ```text

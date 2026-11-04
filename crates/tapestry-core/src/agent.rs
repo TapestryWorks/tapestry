@@ -8,7 +8,9 @@ use tapestry_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
+use crate::context::{next_context_entry, ContextState};
 use crate::error::CoreError;
 use crate::history::{HistoryItem, ToolCall};
 use crate::model::{ModelClient, ModelRequest};
@@ -42,6 +44,7 @@ impl UserInput {
 pub struct AgentLoop {
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
+    clock: Arc<dyn Clock>,
 }
 
 struct Emitter<'a> {
@@ -60,21 +63,41 @@ impl Emitter<'_> {
 
 impl AgentLoop {
     pub fn new(model: Arc<dyn ModelClient>, tools: Arc<ToolRegistry>) -> Self {
-        Self { model, tools }
+        Self::with_clock(model, tools, Arc::new(SystemClock))
     }
 
-    /// Run one turn. The user message is appended to `history`, which keeps
-    /// every item produced by the turn (and stays valid even on error).
+    pub fn with_clock(
+        model: Arc<dyn ModelClient>,
+        tools: Arc<ToolRegistry>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            model,
+            tools,
+            clock,
+        }
+    }
+
+    /// Run one turn. A time-context entry (when due) and the user message are
+    /// appended to `history`, which keeps every item produced by the turn (and
+    /// stays valid even on error). `context` tracks what the model was told.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_turn(
         &self,
         submission_id: SubmissionId,
         turn_id: TurnId,
         input: UserInput,
         history: &mut Vec<HistoryItem>,
+        context: &mut ContextState,
         config: &ThreadConfig,
         event_tx: &mpsc::Sender<Event>,
     ) -> Result<(), CoreError> {
         let user_message = input.content.clone();
+        if let Some(entry) =
+            next_context_entry(context, config.include_time_context, self.clock.as_ref())
+        {
+            history.push(HistoryItem::user(None, entry));
+        }
         history.push(HistoryItem::user(input.name, input.content));
         let out = Emitter {
             submission_id,
@@ -268,6 +291,7 @@ mod tests {
     use tapestry_protocol::{FinishReason, SubmissionId, TurnId};
 
     use super::*;
+    use crate::clock::FixedClock;
     use crate::model::{MockModelClient, ModelResponse};
     use crate::tool::{EchoTool, Tool, ToolResult, ToolSpec};
 
@@ -343,13 +367,19 @@ mod tests {
         let loop_ = AgentLoop::new(model, registry());
         let (tx, mut rx) = mpsc::channel(capacity);
         let sid = SubmissionId::new();
+        // Time context has dedicated tests; keep the rest of the history exact.
+        let config = ThreadConfig {
+            include_time_context: false,
+            ..config.clone()
+        };
         let result = loop_
             .run_turn(
                 sid,
                 TurnId::new(),
                 UserInput::new(message),
                 history,
-                config,
+                &mut ContextState::default(),
+                &config,
                 &tx,
             )
             .await;
@@ -359,6 +389,13 @@ mod tests {
             events.push(event);
         }
         (result, events, sid)
+    }
+
+    fn no_time_context() -> ThreadConfig {
+        ThreadConfig {
+            include_time_context: false,
+            ..Default::default()
+        }
     }
 
     fn kinds(events: &[Event]) -> Vec<String> {
@@ -644,7 +681,8 @@ mod tests {
                 TurnId::new(),
                 UserInput::new("tool:echo"),
                 &mut history,
-                &ThreadConfig::default(),
+                &mut ContextState::default(),
+                &no_time_context(),
                 &tx,
             )
             .await;
@@ -677,7 +715,8 @@ mod tests {
                 TurnId::new(),
                 UserInput::new("go"),
                 &mut history,
-                &ThreadConfig::default(),
+                &mut ContextState::default(),
+                &no_time_context(),
                 &tx,
             )
             .await;
@@ -706,5 +745,203 @@ mod tests {
             .clone()
             .unwrap();
         assert!(prompt.starts_with("Base.") && prompt.contains("planner"));
+    }
+
+    struct TimeHarness {
+        agent: AgentLoop,
+        model: Arc<ScriptedModel>,
+        clock: Arc<FixedClock>,
+        history: Vec<HistoryItem>,
+        context: ContextState,
+        config: ThreadConfig,
+    }
+
+    impl TimeHarness {
+        fn new(turns: usize) -> Self {
+            let model = ScriptedModel::new((0..turns).map(|_| resp(Some("ok"), vec![])).collect());
+            let clock = Arc::new(FixedClock::new("2026-11-04", "Asia/Shanghai"));
+            Self {
+                agent: AgentLoop::with_clock(model.clone(), registry(), clock.clone()),
+                model,
+                clock,
+                history: Vec::new(),
+                context: ContextState::default(),
+                config: ThreadConfig::default(),
+            }
+        }
+
+        async fn turn(&mut self, message: &str) -> (Result<(), CoreError>, Vec<Event>) {
+            let (tx, mut rx) = mpsc::channel(64);
+            let result = self
+                .agent
+                .run_turn(
+                    SubmissionId::new(),
+                    TurnId::new(),
+                    UserInput::new(message),
+                    &mut self.history,
+                    &mut self.context,
+                    &self.config,
+                    &tx,
+                )
+                .await;
+            drop(tx);
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            (result, events)
+        }
+
+        fn context_entries(&self) -> Vec<&str> {
+            self.history
+                .iter()
+                .filter_map(|i| match i {
+                    HistoryItem::User {
+                        name: None,
+                        content,
+                    } if content.starts_with("<environment_context>") => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn first_turn_puts_time_context_before_user_message() {
+        let mut h = TimeHarness::new(1);
+        let (result, _) = h.turn("hello").await;
+        result.unwrap();
+        match (&h.history[0], &h.history[1]) {
+            (
+                HistoryItem::User {
+                    name: None,
+                    content: ctx,
+                },
+                HistoryItem::User { content: msg, .. },
+            ) => {
+                assert!(ctx.contains("<current_date>2026-11-04</current_date>"));
+                assert!(ctx.contains("<timezone>Asia/Shanghai</timezone>"));
+                assert_eq!(msg, "hello");
+            }
+            other => panic!("unexpected history: {other:?}"),
+        }
+        let sent = &h.model.requests.lock().unwrap()[0].history;
+        assert!(
+            matches!(&sent[0], HistoryItem::User { content, .. } if content.contains("environment_context"))
+        );
+    }
+
+    #[tokio::test]
+    async fn same_day_turn_does_not_resend_and_next_day_adds_date_only() {
+        let mut h = TimeHarness::new(3);
+        h.turn("a").await.0.unwrap();
+        h.turn("b").await.0.unwrap();
+        assert_eq!(h.context_entries().len(), 1);
+        h.clock.set("2026-11-05", "Asia/Shanghai");
+        h.turn("c").await.0.unwrap();
+        let entries = h.context_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].contains("2026-11-05") && !entries[1].contains("timezone"));
+    }
+
+    #[tokio::test]
+    async fn disabled_from_start_never_reads_clock_or_injects() {
+        let mut h = TimeHarness::new(1);
+        h.config.include_time_context = false;
+        h.clock.fail();
+        let (result, _) = h.turn("hi").await;
+        result.unwrap();
+        assert_eq!(h.history.len(), 2);
+        assert!(h.context_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_midway_sends_unavailable_once() {
+        let mut h = TimeHarness::new(3);
+        h.turn("a").await.0.unwrap();
+        h.config.include_time_context = false;
+        h.turn("b").await.0.unwrap();
+        h.turn("c").await.0.unwrap();
+        let entries = h.context_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].contains(r#"status="unavailable""#));
+    }
+
+    #[tokio::test]
+    async fn clock_failure_does_not_fail_turn_and_recovers_fully() {
+        let mut h = TimeHarness::new(3);
+        h.clock.fail();
+        let (result, events) = h.turn("a").await;
+        result.unwrap();
+        assert!(!events.iter().any(|e| matches!(e.msg, EventMsg::Error(_))));
+        h.turn("b").await.0.unwrap();
+        assert_eq!(h.context_entries().len(), 1);
+        h.clock.set("2026-11-04", "UTC");
+        h.turn("c").await.0.unwrap();
+        let entries = h.context_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].contains("current_date") && entries[1].contains("timezone"));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_keeps_context_entry_and_valid_history() {
+        let model = ScriptedModel::new(vec![
+            Err(CoreError::Model("down".into())),
+            resp(Some("ok"), vec![]),
+        ]);
+        let clock = Arc::new(FixedClock::new("2026-11-04", "UTC"));
+        let agent = AgentLoop::with_clock(model, registry(), clock);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = Vec::new();
+        let mut ctx = ContextState::default();
+        let config = ThreadConfig::default();
+        let first = agent
+            .run_turn(
+                SubmissionId::new(),
+                TurnId::new(),
+                UserInput::new("a"),
+                &mut history,
+                &mut ctx,
+                &config,
+                &tx,
+            )
+            .await;
+        assert!(first.is_err());
+        assert_eq!(history.len(), 2);
+        agent
+            .run_turn(
+                SubmissionId::new(),
+                TurnId::new(),
+                UserInput::new("b"),
+                &mut history,
+                &mut ctx,
+                &config,
+                &tx,
+            )
+            .await
+            .unwrap();
+        let count = history
+            .iter()
+            .filter(|i| matches!(i, HistoryItem::User { content, .. } if content.contains("environment_context")))
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn time_context_keeps_event_order_and_adds_no_events() {
+        let mut h = TimeHarness::new(1);
+        let (result, events) = h.turn("hello").await;
+        result.unwrap();
+        assert_eq!(
+            kinds(&events),
+            vec![
+                "turn_started",
+                "req_start:0",
+                "agent_message",
+                "req_done:0",
+                "token_count",
+                "turn_complete"
+            ]
+        );
     }
 }

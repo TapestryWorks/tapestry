@@ -150,6 +150,19 @@ mod tests {
     }
 
     #[test]
+    fn time_context_entry_maps_to_plain_user_message() {
+        let text = crate::context::render_context(Some("2026-11-05"), Some("UTC"));
+        let chat_req = model_request_to_chat_request(&request(
+            vec![HistoryItem::user(None, text.clone())],
+            vec![],
+        ));
+        assert_eq!(
+            chat_req.messages[0].content.first_text(),
+            Some(text.as_str())
+        );
+    }
+
+    #[test]
     fn maps_tool_calls_and_results() {
         let call = ToolCall::new("echo", serde_json::json!({"input": "x"}));
         let chat_req = model_request_to_chat_request(&request(

@@ -162,6 +162,9 @@ pub struct ThreadSettings {
     pub max_tool_iterations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// Inject date/time-zone context into history; threads treat `None` as enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_time_context: Option<bool>,
 }
 
 #[cfg(test)]
@@ -329,5 +332,23 @@ mod tests {
         let s: ThreadSettings = serde_json::from_str(r#"{"agent_name":"planner"}"#).unwrap();
         assert_eq!(s.agent_name.as_deref(), Some("planner"));
         assert!(s.model.is_none());
+    }
+
+    #[test]
+    fn thread_settings_include_time_context_roundtrip() {
+        let s = ThreadSettings {
+            include_time_context: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"include_time_context":false}"#);
+        let decoded: ThreadSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, decoded);
+    }
+
+    #[test]
+    fn thread_settings_without_include_time_context_parses_to_none() {
+        let s: ThreadSettings = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert!(s.include_time_context.is_none());
     }
 }

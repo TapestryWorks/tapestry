@@ -3,7 +3,9 @@
 //! Architecture is informed by OpenAI Codex `codex-core`; see `docs/architecture.md`.
 
 pub mod agent;
+pub mod clock;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod history;
 pub mod model;
@@ -15,7 +17,9 @@ pub mod turn;
 pub mod genai;
 
 pub use agent::{AgentLoop, UserInput};
+pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
 pub use config::ThreadConfig;
+pub use context::ContextState;
 pub use error::CoreError;
 pub use history::{fill_missing_tool_results, render_user_content, HistoryItem, ToolCall};
 pub use model::{MockModelClient, ModelClient, ModelRequest, ModelResponse};

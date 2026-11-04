@@ -8,6 +8,8 @@ pub struct ThreadConfig {
     pub max_tool_iterations: u32,
     /// Name of this agent, announced to the model in the system prompt.
     pub agent_name: Option<String>,
+    /// Inject date/time-zone context into history at the start of each turn.
+    pub include_time_context: bool,
 }
 
 impl Default for ThreadConfig {
@@ -17,6 +19,7 @@ impl Default for ThreadConfig {
             system_prompt: None,
             max_tool_iterations: 8,
             agent_name: None,
+            include_time_context: true,
         }
     }
 }
@@ -34,6 +37,9 @@ impl ThreadConfig {
         }
         if let Some(name) = &settings.agent_name {
             self.agent_name = Some(name.clone());
+        }
+        if let Some(include) = settings.include_time_context {
+            self.include_time_context = include;
         }
     }
 
@@ -59,6 +65,7 @@ mod tests {
             system_prompt: None,
             max_tool_iterations: Some(3),
             agent_name: None,
+            include_time_context: None,
         });
         assert_eq!(config.model, "gpt-test");
         assert_eq!(config.max_tool_iterations, 3);
@@ -78,6 +85,23 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(config.agent_name.as_deref(), Some("planner"));
+        assert_eq!(config.model, "m");
+    }
+
+    #[test]
+    fn include_time_context_defaults_on_and_updates_alone() {
+        let mut config = ThreadConfig::default();
+        assert!(config.include_time_context);
+        config.apply_settings(&ThreadSettings {
+            model: Some("m".into()),
+            ..Default::default()
+        });
+        assert!(config.include_time_context);
+        config.apply_settings(&ThreadSettings {
+            include_time_context: Some(false),
+            ..Default::default()
+        });
+        assert!(!config.include_time_context);
         assert_eq!(config.model, "m");
     }
 

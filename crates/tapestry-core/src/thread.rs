@@ -9,7 +9,9 @@ use tapestry_protocol::{
 };
 
 use crate::agent::{AgentLoop, UserInput};
+use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
+use crate::context::ContextState;
 use crate::error::CoreError;
 use crate::history::HistoryItem;
 use crate::model::ModelClient;
@@ -25,6 +27,18 @@ struct Session {
     active_turn: Option<TurnId>,
     /// Kept across turns; in-memory only and unbounded.
     history: Vec<HistoryItem>,
+    /// What the model has been told about the date/time zone.
+    context: ContextState,
+}
+
+impl Session {
+    /// The only way to rewrite history wholesale (compaction, rollback, restore).
+    /// Invalidates the sent time context so the next turn re-sends it in full.
+    #[allow(dead_code)]
+    fn replace_history(&mut self, history: Vec<HistoryItem>) {
+        self.history = history;
+        self.context = ContextState::Unsent;
+    }
 }
 
 fn validate_user_name(name: &str) -> Result<(), CoreError> {
@@ -91,6 +105,14 @@ pub struct TapestryThread {
 
 impl TapestryThread {
     pub fn spawn(model: Arc<dyn ModelClient>, tools: Arc<ToolRegistry>) -> (Self, ThreadHandle) {
+        Self::spawn_with_clock(model, tools, Arc::new(SystemClock))
+    }
+
+    pub fn spawn_with_clock(
+        model: Arc<dyn ModelClient>,
+        tools: Arc<ToolRegistry>,
+        clock: Arc<dyn Clock>,
+    ) -> (Self, ThreadHandle) {
         let thread_id = ThreadId::new();
         let (submission_tx, submission_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
@@ -103,7 +125,7 @@ impl TapestryThread {
         let worker_handle = handle.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                run_thread_loop(thread_id, submission_rx, event_tx, model, tools).await
+                run_thread_loop(thread_id, submission_rx, event_tx, model, tools, clock).await
             {
                 warn!(?err, "thread loop exited with error");
             }
@@ -132,9 +154,10 @@ async fn run_thread_loop(
     event_tx: mpsc::Sender<Event>,
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
+    clock: Arc<dyn Clock>,
 ) -> Result<(), CoreError> {
     let mut session = Session::default();
-    let agent = AgentLoop::new(model, tools);
+    let agent = AgentLoop::with_clock(model, tools, clock);
 
     while let Some(submission) = submission_rx.recv().await {
         debug!(submission_id = %submission.id, "processing submission");
@@ -238,6 +261,7 @@ async fn process_submission(
                         name: user_name,
                     },
                     &mut session.history,
+                    &mut session.context,
                     &session.config,
                     event_tx,
                 )
@@ -333,6 +357,19 @@ mod tests {
         handle.collect_events_for(id).await;
     }
 
+    async fn configure_without_time_context(handle: &ThreadHandle) {
+        configure(handle).await;
+        handle
+            .submit(Op::ThreadSettings {
+                settings: tapestry_protocol::ThreadSettings {
+                    include_time_context: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+
     async fn turn(handle: &ThreadHandle, msg: &str, user_name: Option<&str>) -> Vec<Event> {
         let id = handle
             .submit(Op::StartTurn {
@@ -376,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn history_persists_across_turns() {
         let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
-        configure(&handle).await;
+        configure_without_time_context(&handle).await;
         assert_eq!(agent_text(&turn(&handle, "one", None).await), "items=1");
         // user, assistant, user
         assert_eq!(agent_text(&turn(&handle, "two", None).await), "items=3");
@@ -393,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_user_name_errors_and_leaves_history() {
         let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
-        configure(&handle).await;
+        configure_without_time_context(&handle).await;
         for bad in ["", "   ", "a\nb"] {
             let events = turn(&handle, "hi", Some(bad)).await;
             assert!(
@@ -451,5 +488,72 @@ mod tests {
             .unwrap();
         let text = agent_text(&turn(&handle, "x", None).await);
         assert!(text.contains("planner"));
+    }
+
+    #[tokio::test]
+    async fn thread_injects_time_context_once_per_day_and_honors_setting() {
+        use crate::clock::FixedClock;
+
+        /// Echoes how many time-context entries the request history holds.
+        struct ContextCountModel;
+        #[async_trait::async_trait]
+        impl ModelClient for ContextCountModel {
+            async fn complete(
+                &self,
+                request: crate::model::ModelRequest,
+            ) -> Result<crate::model::ModelResponse, CoreError> {
+                let n = request
+                    .history
+                    .iter()
+                    .filter(|i| matches!(i, HistoryItem::User { content, .. } if content.contains("environment_context")))
+                    .count();
+                Ok(crate::model::ModelResponse {
+                    content: Some(n.to_string()),
+                    tool_calls: vec![],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                })
+            }
+        }
+
+        let clock = Arc::new(FixedClock::new("2026-11-04", "UTC"));
+        let (_t, handle) = TapestryThread::spawn_with_clock(
+            Arc::new(ContextCountModel),
+            test_tools(),
+            clock.clone(),
+        );
+        configure(&handle).await;
+        assert_eq!(agent_text(&turn(&handle, "a", None).await), "1");
+        assert_eq!(agent_text(&turn(&handle, "b", None).await), "1");
+        clock.set("2026-11-05", "UTC");
+        assert_eq!(agent_text(&turn(&handle, "c", None).await), "2");
+
+        handle
+            .submit(Op::ThreadSettings {
+                settings: tapestry_protocol::ThreadSettings {
+                    include_time_context: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        // Disabling after a send appends one "unavailable" entry.
+        assert_eq!(agent_text(&turn(&handle, "d", None).await), "3");
+        assert_eq!(agent_text(&turn(&handle, "e", None).await), "3");
+    }
+
+    #[test]
+    fn replace_history_resets_context_so_next_turn_resends() {
+        use crate::clock::FixedClock;
+        use crate::context::next_context_entry;
+
+        let clock = FixedClock::new("2026-11-05", "UTC");
+        let mut session = Session::default();
+        assert!(next_context_entry(&mut session.context, true, &clock).is_some());
+        assert!(next_context_entry(&mut session.context, true, &clock).is_none());
+        session.replace_history(Vec::new());
+        assert!(session.history.is_empty());
+        let text = next_context_entry(&mut session.context, true, &clock).unwrap();
+        assert!(text.contains("current_date") && text.contains("timezone"));
     }
 }

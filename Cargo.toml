@@ -17,6 +17,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+iana-time-zone = "0.1"
 
 tapestry-protocol = { path = "crates/tapestry-protocol" }
 genai = "0.6"
