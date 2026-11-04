@@ -23,6 +23,7 @@ impl Event {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
+    Warning(WarningEvent),
     Error(ErrorEvent),
     SessionConfigured(SessionConfiguredEvent),
     TurnStarted(TurnStartedEvent),
@@ -31,10 +32,16 @@ pub enum EventMsg {
     ToolCallEnd(ToolCallEndEvent),
     ModelRequestStarted(ModelRequestStartedEvent),
     ModelRequestCompleted(ModelRequestCompletedEvent),
-    Warning(WarningEvent),
     TokenCount(TokenCountEvent),
     TurnComplete(TurnCompleteEvent),
     TurnAborted(TurnAbortedEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarningEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,13 +124,6 @@ pub struct ModelRequestCompletedEvent {
     pub iteration: u32,
     pub input_tokens: u32,
     pub output_tokens: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WarningEvent {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<TurnId>,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
