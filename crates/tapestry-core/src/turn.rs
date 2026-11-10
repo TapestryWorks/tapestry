@@ -3,47 +3,12 @@
 //! [`TurnMachine`] performs no IO: the driver ([`crate::agent::AgentLoop`])
 //! asks for the [`TurnStep`], performs it, and feeds the outcome back.
 
-use tapestry_protocol::{FinishReason, ToolCallId, ToolCallStatus};
+use tapestry_protocol::{
+    FinishReason, HistoryItem, ModelOutputEffect, SystemReminder, ToolCall, ToolResult, TurnStep,
+};
 
 use crate::error::CoreError;
-use crate::history::{fill_missing_tool_results, HistoryItem, ToolCall};
-
-/// Temporary instruction for the forced final call; never stored in history.
-pub const FORCED_FINISH_REMINDER: &str =
-    "The tool call limit has been reached. Do not call any tools; summarize your progress and answer now.";
-
-/// What the driver must do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnStep {
-    CallModel {
-        iteration: u32,
-        allow_tools: bool,
-        reminder: Option<String>,
-    },
-    RunTools {
-        calls: Vec<ToolCall>,
-    },
-    Done {
-        finish: FinishReason,
-        last_agent_message: Option<String>,
-    },
-}
-
-/// Result of one executed tool call (or a synthesized one, e.g. `not_found`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolOutcome {
-    pub call_id: ToolCallId,
-    pub tool_name: String,
-    pub output: String,
-    pub status: ToolCallStatus,
-}
-
-/// What `on_model_output` did with the model output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ModelOutputEffect {
-    /// Tool calls dropped because the forced final call must not use tools.
-    pub ignored_tool_calls: usize,
-}
+use crate::history::fill_missing_tool_results;
 
 #[derive(Debug)]
 enum Phase {
@@ -83,7 +48,7 @@ impl<'a> TurnMachine<'a> {
                 TurnStep::CallModel {
                     iteration: self.iteration,
                     allow_tools,
-                    reminder: (!allow_tools).then(|| FORCED_FINISH_REMINDER.to_string()),
+                    reminder: (!allow_tools).then_some(SystemReminder::ToolLimitReached),
                 }
             }
             Phase::NeedTools(calls) => TurnStep::RunTools {
@@ -135,28 +100,22 @@ impl<'a> TurnMachine<'a> {
     }
 
     /// Record tool results, in call order, and schedule the next model call.
-    pub fn on_tool_outcomes(&mut self, outcomes: Vec<ToolOutcome>) -> Result<(), CoreError> {
+    pub fn on_tool_results(&mut self, results: Vec<ToolResult>) -> Result<(), CoreError> {
         let Phase::NeedTools(calls) = &self.phase else {
             return Err(CoreError::Internal(
-                "tool outcomes without tool calls".into(),
+                "tool results without tool calls".into(),
             ));
         };
-        let matches = calls.len() == outcomes.len()
-            && calls.iter().zip(&outcomes).all(|(c, o)| c.id == o.call_id);
+        let matches = calls.len() == results.len()
+            && calls.iter().zip(&results).all(|(c, r)| c.id == r.call_id);
         if !matches {
             return Err(CoreError::Internal(
-                "tool outcomes do not match requested calls".into(),
+                "tool results do not match requested calls".into(),
             ));
         }
 
-        for outcome in outcomes {
-            self.history.push(HistoryItem::tool_result(
-                outcome.call_id,
-                outcome.tool_name,
-                outcome.output,
-                outcome.status,
-            ));
-        }
+        self.history
+            .extend(results.into_iter().map(HistoryItem::from));
         self.phase = Phase::NeedModel;
         Ok(())
     }
@@ -170,12 +129,17 @@ impl<'a> TurnMachine<'a> {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use tapestry_protocol::{ToolCallId, ToolCallStatus};
 
     use super::*;
 
-    fn outcome(call: &ToolCall, status: ToolCallStatus) -> ToolOutcome {
-        ToolOutcome {
-            call_id: call.id,
+    fn call(name: &str) -> ToolCall {
+        ToolCall::new(ToolCallId::generate(), name, Value::Null)
+    }
+
+    fn outcome(call: &ToolCall, status: ToolCallStatus) -> ToolResult {
+        ToolResult {
+            call_id: call.id.clone(),
             tool_name: call.name.clone(),
             output: "out".into(),
             status,
@@ -214,8 +178,8 @@ mod tests {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 3);
-        let a = ToolCall::new("echo", Value::Null);
-        let b = ToolCall::new("echo", Value::Null);
+        let a = call("echo");
+        let b = call("echo");
         m.on_model_output(None, vec![a.clone(), b.clone()]).unwrap();
         assert_eq!(
             m.next_step(),
@@ -223,7 +187,7 @@ mod tests {
                 calls: vec![a.clone(), b.clone()]
             }
         );
-        m.on_tool_outcomes(vec![
+        m.on_tool_results(vec![
             outcome(&a, ToolCallStatus::Completed),
             outcome(&b, ToolCallStatus::Completed),
         ])
@@ -244,8 +208,8 @@ mod tests {
         assert!(
             matches!(&h[1], HistoryItem::Assistant { tool_calls, .. } if tool_calls.len() == 2)
         );
-        assert!(matches!(&h[2], HistoryItem::ToolResult { call_id, .. } if *call_id == a.id));
-        assert!(matches!(&h[3], HistoryItem::ToolResult { call_id, .. } if *call_id == b.id));
+        assert!(matches!(&h[2], HistoryItem::ToolResult(r) if r.call_id == a.id));
+        assert!(matches!(&h[3], HistoryItem::ToolResult(r) if r.call_id == b.id));
         assert!(matches!(&h[4], HistoryItem::Assistant { content: Some(c), .. } if c == "fin"));
     }
 
@@ -254,10 +218,10 @@ mod tests {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 3);
-        let a = ToolCall::new("echo", Value::Null);
-        let b = ToolCall::new("ghost", Value::Null);
+        let a = call("echo");
+        let b = call("ghost");
         m.on_model_output(None, vec![a.clone(), b.clone()]).unwrap();
-        m.on_tool_outcomes(vec![
+        m.on_tool_results(vec![
             outcome(&a, ToolCallStatus::Failed),
             outcome(&b, ToolCallStatus::NotFound),
         ])
@@ -265,17 +229,11 @@ mod tests {
         assert!(matches!(m.next_step(), TurnStep::CallModel { .. }));
         assert!(matches!(
             &m.history()[2],
-            HistoryItem::ToolResult {
-                status: ToolCallStatus::Failed,
-                ..
-            }
+            HistoryItem::ToolResult(r) if r.status == ToolCallStatus::Failed
         ));
         assert!(matches!(
             &m.history()[3],
-            HistoryItem::ToolResult {
-                status: ToolCallStatus::NotFound,
-                ..
-            }
+            HistoryItem::ToolResult(r) if r.status == ToolCallStatus::NotFound
         ));
     }
 
@@ -284,9 +242,9 @@ mod tests {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 1);
-        let a = ToolCall::new("echo", Value::Null);
+        let a = call("echo");
         m.on_model_output(None, vec![a.clone()]).unwrap();
-        m.on_tool_outcomes(vec![outcome(&a, ToolCallStatus::Completed)])
+        m.on_tool_results(vec![outcome(&a, ToolCallStatus::Completed)])
             .unwrap();
 
         let TurnStep::CallModel {
@@ -299,7 +257,7 @@ mod tests {
         };
         assert_eq!(iteration, 1);
         assert!(!allow_tools);
-        assert!(reminder.is_some());
+        assert_eq!(reminder, Some(SystemReminder::ToolLimitReached));
 
         let effect = m.on_model_output(Some("summary".into()), vec![]).unwrap();
         assert_eq!(effect.ignored_tool_calls, 0);
@@ -310,9 +268,10 @@ mod tests {
                 last_agent_message: Some("summary".into())
             }
         );
-        assert!(!m.history().iter().any(
-            |i| matches!(i, HistoryItem::User { content, .. } if content == FORCED_FINISH_REMINDER)
-        ));
+        assert!(!m
+            .history()
+            .iter()
+            .any(|i| matches!(i, HistoryItem::SystemReminder(_))));
         assert_eq!(m.history().len(), 4);
     }
 
@@ -328,9 +287,7 @@ mod tests {
                 ..
             }
         ));
-        let effect = m
-            .on_model_output(None, vec![ToolCall::new("echo", Value::Null)])
-            .unwrap();
+        let effect = m.on_model_output(None, vec![call("echo")]).unwrap();
         assert_eq!(effect.ignored_tool_calls, 1);
         assert!(matches!(
             m.next_step(),
@@ -345,17 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_outcomes_are_rejected() {
+    fn mismatched_results_are_rejected() {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 3);
-        let a = ToolCall::new("echo", Value::Null);
-        let other = ToolCall::new("echo", Value::Null);
+        let a = call("echo");
+        let other = call("echo");
         m.on_model_output(None, vec![a]).unwrap();
         assert!(m
-            .on_tool_outcomes(vec![outcome(&other, ToolCallStatus::Completed)])
+            .on_tool_results(vec![outcome(&other, ToolCallStatus::Completed)])
             .is_err());
-        assert!(m.on_tool_outcomes(vec![]).is_err());
+        assert!(m.on_tool_results(vec![]).is_err());
     }
 
     #[test]
@@ -363,7 +320,7 @@ mod tests {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 3);
-        assert!(m.on_tool_outcomes(vec![]).is_err());
+        assert!(m.on_tool_results(vec![]).is_err());
         m.on_model_output(Some("x".into()), vec![]).unwrap();
         assert!(m.on_model_output(None, vec![]).is_err());
     }
@@ -373,15 +330,15 @@ mod tests {
         let mut history = Vec::new();
         start(&mut history);
         let mut m = TurnMachine::new(&mut history, 3);
-        let a = ToolCall::new("echo", Value::Null);
-        let b = ToolCall::new("echo", Value::Null);
+        let a = call("echo");
+        let b = call("echo");
         m.on_model_output(None, vec![a.clone(), b.clone()]).unwrap();
         m.repair_history();
 
         for call in [&a, &b] {
             assert!(m.history().iter().any(|i| matches!(
                 i,
-                HistoryItem::ToolResult { call_id, status: ToolCallStatus::Failed, .. } if *call_id == call.id
+                HistoryItem::ToolResult(r) if r.call_id == call.id && r.status == ToolCallStatus::Failed
             )));
         }
     }

@@ -35,7 +35,7 @@ CI 会在向 `main` 分支推送以及创建拉取请求时，使用 Rust stable
 
 Tapestry 是一个采用 Codex SQ/EQ 设计的异步智能体内核：
 
-- `tapestry-protocol` 是依赖较少的公开通信协议层，包含客户端操作（`Submission`、`Op`）、输出事件（`Event`、`EventMsg`）、基于 UUID 的 ID，以及用于局部更新的 `ThreadSettings`。面向传输的类型和 serde 行为应放在这里；该 crate 不得依赖 `tapestry-core`。
+- `tapestry-protocol` 是依赖较少的协议层，维护所有协议类型，并按层划分模块：`ids` ← `common` ← `tool` ← `history` ← {`model`, `react`}，`client`（`Submission`、`Op`、`Event`、`EventMsg`、`ThreadSettings`）只依赖 `ids`、`common`、`tool`，不得依赖 `react`。数据契约和 serde 行为放在这里；`tapestry-core` 只保留行为（trait、状态机、IO、策略、渲染）。该 crate 不得依赖 `tapestry-core`。
 - `tapestry-core` 负责运行时行为。`TapestryThread::spawn` 会创建有界的 Tokio 提交/事件通道以及长期运行的工作任务；`ThreadHandle` 是客户端提交操作和消费事件的接口。
 - 线程工作任务保存会话配置，并按顺序处理提交。执行 `Op::StartTurn` 前，线程必须先收到 `Op::Configure`，或首次收到 `Op::ThreadSettings`。运行时错误统一在线程工作任务边界转换为与原始提交关联的 `EventMsg::Error`。
 - `AgentLoop::run_turn` 执行“模型 -> 可选工具 -> 模型”的迭代流程。它会发送生命周期事件、累计每次模型调用的 token 数，并在模型不再返回工具调用或超过 `max_tool_iterations` 时停止。
@@ -46,9 +46,10 @@ Tapestry 是一个采用 Codex SQ/EQ 设计的异步智能体内核：
 
 ## 协议与事件约定
 
-- `SubmissionId` 用于将每个事件与触发它的请求关联；`TurnId` 标识逻辑回合；`ToolCallId` 配对工具调用的开始和结束事件。新增操作或事件时必须保持这些 ID 的职责分离。
+- `SubmissionId` 用于将每个事件与触发它的请求关联；`TurnId` 标识逻辑回合；`ToolCallId` 配对工具调用的开始和结束事件；它是模型提供方给出的不透明字符串（仅在提供方未给出时用 `ToolCallId::generate()` 兜底），任何逻辑都不得解析它。新增操作或事件时必须保持这些 ID 的职责分离。
 - 协议枚举使用内部标签的 serde 表示：`#[serde(tag = "type", rename_all = "snake_case")]`。可选的请求和设置字段使用 serde 默认值，并在值为 `None` 时省略。修改公开协议时应保持线格式兼容，并增加 serde 往返测试。
-- 新增 ID 类型时使用 `ids.rs` 中私有的 `id_type!` 模式，使其保持为透明 UUID newtype，并具备一致的创建、解析、显示、哈希和 serde 行为。
+- 新增 UUID 类型的 ID 时使用 `ids.rs` 中私有的 `id_type!` 模式，使其保持为透明 UUID newtype，并具备一致的创建、解析、显示、哈希和 serde 行为；`ToolCallId` 是字符串 newtype，不使用该宏。
+- `HistoryItem` 除 `User`、`Assistant`、`ToolResult` 外，还有结构化条目 `EnvironmentContext`（持久化，历史中最后一条即时间上下文基线，每条为完整快照）和 `SystemReminder`（只追加到单次模型请求的 history 副本，不持久化）。发给模型的文本统一由 `tapestry-core::prompt` 渲染，不要在条目里存渲染后的字符串。工具结果统一为 `ToolResult`，token 用量统一为 `TokenUsage`。
 - 新操作的分发逻辑放在 `thread::process_submission`；回合、模型和工具执行逻辑放在 `AgentLoop`。通过现有事件通道发送事件，并将通道关闭映射为 `CoreError::ChannelClosed`。
 - `ThreadSettings` 是局部更新：`ThreadConfig::apply_settings` 只更新值为 `Some` 的字段。第一次提交设置会完成线程配置并发送 `SessionConfigured`；后续设置更新目前不会发送确认事件。
 - `ThreadHandle::collect_events_for` 会持续读取共享事件流，直到收到匹配提交的终止事件（`TurnComplete`、`TurnAborted`、`Error` 或 `SessionConfigured`）。返回结果可能包含其他提交的中间事件，因此消费者必须使用 `Event.id` 进行关联。

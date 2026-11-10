@@ -1,26 +1,17 @@
 use async_trait::async_trait;
 
 use crate::error::CoreError;
-use crate::history::{render_user_content, HistoryItem, ToolCall};
-use crate::tool::ToolSpec;
+use crate::prompt::render_user;
+use tapestry_protocol::{
+    HistoryItem, ModelRequest, ModelResponse, TokenUsage, ToolCall, ToolCallId,
+};
 
-/// Outcome of a single model completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelResponse {
-    pub content: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-}
-
-/// Conversation state passed to the model client.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelRequest {
-    pub system_prompt: Option<String>,
-    pub history: Vec<HistoryItem>,
-    /// Empty when tools are not allowed for this call.
-    pub tools: Vec<ToolSpec>,
-    pub iteration: u32,
+fn usage(input_tokens: u64, output_tokens: u64) -> TokenUsage {
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        ..Default::default()
+    }
 }
 
 #[async_trait]
@@ -34,6 +25,9 @@ pub trait ModelClient: Send + Sync {
 /// - If it contains `tool:NAME` and no tool result follows it, request that tool.
 /// - If tool results follow it, respond with a summary message.
 /// - Otherwise: echo the (rendered) user message.
+///
+/// Environment context and system reminder items are not user messages and
+/// are never echoed.
 #[derive(Debug, Default)]
 pub struct MockModelClient;
 
@@ -54,18 +48,17 @@ impl ModelClient for MockModelClient {
             return Ok(ModelResponse {
                 content: Some("Echo: ".into()),
                 tool_calls: vec![],
-                input_tokens: 8,
-                output_tokens: 4,
+                usage: usage(8, 4),
             });
         };
 
-        let rendered = render_user_content(name, content);
+        let rendered = render_user(name, content);
         let results: Vec<(&str, &str)> = request.history[idx + 1..]
             .iter()
             .filter_map(|item| match item {
-                HistoryItem::ToolResult {
-                    tool_name, output, ..
-                } => Some((tool_name.as_str(), output.as_str())),
+                HistoryItem::ToolResult(result) => {
+                    Some((result.tool_name.as_str(), result.output.as_str()))
+                }
                 _ => None,
             })
             .collect();
@@ -75,11 +68,11 @@ impl ModelClient for MockModelClient {
                 return Ok(ModelResponse {
                     content: None,
                     tool_calls: vec![ToolCall::new(
+                        ToolCallId::generate(),
                         tool_name,
                         serde_json::json!({ "input": rendered }),
                     )],
-                    input_tokens: 12,
-                    output_tokens: 6,
+                    usage: usage(12, 6),
                 });
             }
 
@@ -92,16 +85,14 @@ impl ModelClient for MockModelClient {
             return Ok(ModelResponse {
                 content: Some(format!("Done. Tool results: {summary}")),
                 tool_calls: vec![],
-                input_tokens: 20,
-                output_tokens: 10,
+                usage: usage(20, 10),
             });
         }
 
         Ok(ModelResponse {
             content: Some(format!("Echo: {rendered}")),
             tool_calls: vec![],
-            input_tokens: 8,
-            output_tokens: 4,
+            usage: usage(8, 4),
         })
     }
 }
@@ -114,7 +105,7 @@ fn parse_tool_request(message: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use tapestry_protocol::ToolCallStatus;
+    use tapestry_protocol::{EnvironmentContext, SystemReminder, ToolResult};
 
     use super::*;
 
@@ -167,7 +158,7 @@ mod tests {
                 vec![
                     user,
                     HistoryItem::assistant(None, vec![call.clone()]),
-                    HistoryItem::tool_result(call.id, "echo", "hi", ToolCallStatus::Completed),
+                    ToolResult::completed(&call, "hi").into(),
                 ],
                 1,
             ))
@@ -179,13 +170,13 @@ mod tests {
 
     #[tokio::test]
     async fn mock_ignores_tool_results_of_earlier_turns() {
-        let call = ToolCall::new("echo", serde_json::Value::Null);
+        let call = ToolCall::new(ToolCallId::generate(), "echo", serde_json::Value::Null);
         let response = MockModelClient
             .complete(request(
                 vec![
                     HistoryItem::user(None, "tool:echo"),
                     HistoryItem::assistant(None, vec![call.clone()]),
-                    HistoryItem::tool_result(call.id, "echo", "x", ToolCallStatus::Completed),
+                    ToolResult::completed(&call, "x").into(),
                     HistoryItem::assistant(Some("Done".into()), vec![]),
                     HistoryItem::user(None, "plain"),
                 ],
@@ -194,5 +185,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.content.as_deref(), Some("Echo: plain"));
+    }
+
+    #[tokio::test]
+    async fn mock_does_not_echo_structured_items() {
+        let response = MockModelClient
+            .complete(request(
+                vec![
+                    HistoryItem::user(None, "question"),
+                    EnvironmentContext::Unavailable.into(),
+                    HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
+                ],
+                1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("Echo: question"));
     }
 }

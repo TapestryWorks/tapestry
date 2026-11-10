@@ -32,11 +32,11 @@
 - **THEN** 系统生成状态为 `not_found` 的工具结果并回灌给模型，回合继续
 
 #### Scenario: 工具返回失败
-- **WHEN** 工具返回 `success` 为 false
-- **THEN** 系统生成状态为 `failed` 的工具结果并回灌给模型，回合继续
+- **WHEN** 工具返回状态为 `failed` 的结果
+- **THEN** 该结果被写入 history 并回灌给模型，回合继续
 
 ### Requirement: 超限后强制收尾
-当已达到 `max_tool_iterations` 且模型仍请求工具时，系统 SHALL 再进行一次不提供工具的模型调用并附带临时提示要求总结，然后以 `exceed_max_iters` 正常结束回合，而不是报错。
+当已达到 `max_tool_iterations` 且模型仍请求工具时，系统 SHALL 再进行一次不提供工具的模型调用，并在该次请求的 history 末尾附加一条 `tool_limit_reached` 系统提醒，要求模型总结。之后系统以 `exceed_max_iters` 正常结束回合，而不是报错。
 
 #### Scenario: 超过迭代上限
 - **WHEN** 模型在每次调用中都请求工具并达到上限
@@ -48,7 +48,7 @@
 
 #### Scenario: 临时提示不进入 history
 - **WHEN** 强制收尾发生
-- **THEN** 用于要求总结的提示不会被写入持久 history
+- **THEN** 收尾请求的 history 以 `tool_limit_reached` 系统提醒结尾，而回合结束后的持久 history 中不存在任何系统提醒条目
 
 ### Requirement: 基础设施错误终止回合
 当事件通道关闭或模型调用失败时，系统 SHALL 终止回合并向调用方返回错误；终止后的 history SHALL 保持对模型请求合法。

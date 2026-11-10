@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::common::{FinishReason, TokenUsage};
 use crate::ids::{SubmissionId, ThreadId, ToolCallId, TurnId};
+use crate::tool::ToolResult;
 
 /// Event Queue entry — a response from the agent to the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,32 +79,9 @@ pub struct ToolCallBeginEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallEndEvent {
     pub turn_id: TurnId,
-    pub tool_call_id: ToolCallId,
-    pub tool_name: String,
-    pub output: String,
-    pub success: bool,
-    /// Authoritative outcome; `success` is kept for compatibility.
-    #[serde(default)]
-    pub status: ToolCallStatus,
+    pub result: ToolResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCallStatus {
-    #[default]
-    Completed,
-    Failed,
-    NotFound,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FinishReason {
-    #[default]
-    Completed,
-    ExceedMaxIters,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,16 +101,14 @@ pub struct ModelRequestStartedEvent {
 pub struct ModelRequestCompletedEvent {
     pub turn_id: TurnId,
     pub iteration: u32,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCountEvent {
     pub turn_id: TurnId,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub total_tokens: u32,
+    /// Summed over every model call of the turn.
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +128,7 @@ pub struct TurnAbortedEvent {
     pub message: Option<String>,
 }
 
-/// Mutable thread/session settings applied via [`crate::submission::Op::ThreadSettings`].
+/// Mutable thread/session settings applied via [`crate::client::Op::ThreadSettings`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ThreadSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +148,17 @@ pub struct ThreadSettings {
 mod tests {
     use super::*;
     use crate::ids::SubmissionId;
+    use crate::tool::{ToolCall, ToolCallStatus};
+
+    fn result(status: ToolCallStatus) -> ToolResult {
+        let call = ToolCall::new(ToolCallId::from("call_1"), "echo", serde_json::json!({}));
+        ToolResult {
+            call_id: call.id,
+            tool_name: call.name,
+            output: "hi".into(),
+            status,
+        }
+    }
 
     #[test]
     fn event_msg_agent_message_roundtrip() {
@@ -189,7 +177,7 @@ mod tests {
     #[test]
     fn tool_call_events_have_distinct_types() {
         let turn_id = TurnId::new();
-        let tool_call_id = ToolCallId::new();
+        let tool_call_id = ToolCallId::from("call_1");
 
         let begin = EventMsg::ToolCallBegin(ToolCallBeginEvent {
             turn_id,
@@ -199,11 +187,7 @@ mod tests {
         });
         let end = EventMsg::ToolCallEnd(ToolCallEndEvent {
             turn_id,
-            tool_call_id,
-            tool_name: "echo".into(),
-            output: "hi".into(),
-            success: true,
-            status: ToolCallStatus::Completed,
+            result: result(ToolCallStatus::Completed),
             duration_ms: Some(3),
         });
 
@@ -218,11 +202,14 @@ mod tests {
     fn token_count_event_fields() {
         let msg = EventMsg::TokenCount(TokenCountEvent {
             turn_id: TurnId::new(),
-            input_tokens: 10,
-            output_tokens: 20,
-            total_tokens: 30,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                ..Default::default()
+            },
         });
         let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""total_tokens":30"#));
         let decoded: EventMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, decoded);
     }
@@ -257,8 +244,12 @@ mod tests {
             ModelRequestCompletedEvent {
                 turn_id,
                 iteration: 1,
-                input_tokens: 4,
-                output_tokens: 5,
+                usage: TokenUsage {
+                    input_tokens: 4,
+                    output_tokens: 5,
+                    cache_read_tokens: 1,
+                    cache_write_tokens: 0,
+                },
             },
         ));
         roundtrip(EventMsg::Warning(WarningEvent {
@@ -271,21 +262,23 @@ mod tests {
         }));
         roundtrip(EventMsg::ToolCallEnd(ToolCallEndEvent {
             turn_id,
-            tool_call_id: ToolCallId::new(),
-            tool_name: "nope".into(),
-            output: "missing".into(),
-            success: false,
-            status: ToolCallStatus::NotFound,
+            result: result(ToolCallStatus::NotFound),
             duration_ms: None,
         }));
     }
 
     #[test]
-    fn tool_status_wire_format() {
-        assert_eq!(
-            serde_json::to_string(&ToolCallStatus::NotFound).unwrap(),
-            r#""not_found""#
-        );
+    fn tool_call_end_carries_result_without_success() {
+        let msg = EventMsg::ToolCallEnd(ToolCallEndEvent {
+            turn_id: TurnId::new(),
+            result: result(ToolCallStatus::Failed),
+            duration_ms: Some(1),
+        });
+        let value = serde_json::to_value(&msg).unwrap();
+        assert!(value.get("success").is_none());
+        assert_eq!(value["result"]["status"], "failed");
+        assert_eq!(value["result"]["call_id"], "call_1");
+        roundtrip(msg);
     }
 
     #[test]
@@ -304,17 +297,6 @@ mod tests {
     #[test]
     fn missing_new_fields_deserialize_to_defaults() {
         let id = TurnId::new();
-        let end = format!(
-            r#"{{"type":"tool_call_end","turn_id":"{id}","tool_call_id":"{}","tool_name":"e","output":"o","success":true}}"#,
-            ToolCallId::new()
-        );
-        match serde_json::from_str::<EventMsg>(&end).unwrap() {
-            EventMsg::ToolCallEnd(e) => {
-                assert_eq!(e.status, ToolCallStatus::Completed);
-                assert_eq!(e.duration_ms, None);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
         let done = format!(r#"{{"type":"turn_complete","turn_id":"{id}"}}"#);
         match serde_json::from_str::<EventMsg>(&done).unwrap() {
             EventMsg::TurnComplete(e) => {

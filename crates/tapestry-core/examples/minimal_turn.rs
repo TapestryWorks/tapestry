@@ -24,9 +24,9 @@ async fn main() {
 
     let turn_id = handle
         .submit(Op::StartTurn {
-            user_message: "hello tapestry".into(),
+            content: "hello tapestry".into(),
+            name: None,
             turn_id: None,
-            user_name: None,
         })
         .await
         .expect("start turn");

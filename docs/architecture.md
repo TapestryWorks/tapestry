@@ -42,45 +42,69 @@ Each `Submission` carries a correlating `SubmissionId`; every `Event` echoes tha
 
 | Codex (`codex-core` / `codex-protocol`) | Tapestry | Notes |
 |-------------------------------------------|----------|-------|
-| `protocol.rs` — `Submission`, `Op`, `Event`, `EventMsg` | `tapestry-protocol::{submission, event}` | Reduced op/event set for v1 |
+| `protocol.rs` — `Submission`, `Op`, `Event`, `EventMsg` | `tapestry-protocol::client::{submission, event}` | Reduced op/event set for v1 |
 | `codex_thread.rs` — thread lifecycle | `tapestry-core::thread` | `TapestryThread`, `ThreadHandle` |
 | `agent/` — turn control & loop | `tapestry-core::{turn, agent}` | `TurnMachine` (pure decisions) + `AgentLoop::run_turn` (IO driver) |
-| conversation history | `tapestry-core::history` | `HistoryItem`, `render_user_content` |
-| `client.rs` — model streaming | `tapestry-core::model` | `ModelClient` trait + `MockModelClient` |
+| conversation history | `tapestry-protocol::history` (types), `tapestry-core::history` (helpers) | `HistoryItem`, `EnvironmentContext`, `SystemReminder`; `fill_missing_tool_results` |
+| `client.rs` — model streaming | `tapestry-protocol::model` (types), `tapestry-core::model` (behavior) | `ModelRequest`/`ModelResponse`; `ModelClient` trait + `MockModelClient` |
+| prompt rendering | `tapestry-core::prompt` | `render_user`, `render_environment_context`, `render_system_reminder` |
 | config / session settings | `tapestry-core::config` + `ThreadSettings` | Sparse overrides |
-| tool execution | `tapestry-core::tool` | `Tool` trait, `ToolSpec`, `ToolRegistry` |
+| tool execution | `tapestry-core::tool`, `tapestry-protocol::tool` | `Tool` trait, `ToolRegistry`; `ToolSpec`, `ToolCall`, `ToolResult` (protocol) |
+
+### Protocol layers
+
+`tapestry-protocol` owns every protocol type and groups them by layer; `tapestry-core` keeps only behavior (traits, state machine, IO, policy, rendering).
+
+```text
+ids <- common <- tool <- history <- { model, react }
+client (submission, event) -> { ids, common, tool }   // never react
+```
+
+| Layer | Contents |
+|-------|----------|
+| `ids` | `SubmissionId`, `TurnId`, `ThreadId` (UUID); `ToolCallId` (opaque string) |
+| `common` | `TokenUsage`, `FinishReason` |
+| `tool` | `ToolSpec`, `ToolCall`, `ToolCallStatus`, `ToolResult` |
+| `history` | `HistoryItem`, `EnvironmentContext`, `SystemReminder` |
+| `model` | `ModelRequest`, `ModelResponse` (backend-neutral model protocol) |
+| `react` | `TurnStep`, `ModelOutputEffect` (driver ↔ state machine) |
+| `client` | `Submission`, `Op`, `Event`, `EventMsg`, `ThreadSettings` |
+
+- `ToolCallId` is the provider's original call id; it is generated (`call_` + UUID) only when the provider gives none. Treat it as opaque.
+- `ToolResult { call_id, tool_name, output, status }` is the single result type: tools return it, history stores it, `ToolCallEnd` carries it. After a tool runs, `AgentLoop` overwrites `call_id`/`tool_name` with those of the call.
+- `TokenUsage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }` (`u64`). `input_tokens` excludes cache reads/writes (genai's total prompt tokens are split accordingly); `output_tokens` includes reasoning. `total_tokens` is derived: written on serialization, ignored on deserialization.
 
 ## Turn execution
 
 ### State machine and driver
 
-`TurnMachine` is synchronous and performs no IO. It exposes `next_step()` (`CallModel`, `RunTools`, `Done`) and is advanced by `on_model_output` / `on_tool_outcomes`, which also write the turn's items to history. `AgentLoop::run_turn` is the async driver: it performs the step, times tools, and emits events. `RunTools` is a batch so parallel execution can be added later.
+`TurnMachine` is synchronous and performs no IO. It exposes `next_step()` (`CallModel`, `RunTools`, `Done`) and is advanced by `on_model_output` / `on_tool_results`, which also write the turn's items to history. `AgentLoop::run_turn` is the async driver: it performs the step, times tools, and emits events. `RunTools` is a batch so parallel execution can be added later.
 
 - A model output without tool calls ends the turn with `finish_reason: completed`.
 - Tool calls are executed in order and their results fed back; unknown tools (`not_found`) and failures (`failed`) are results, not errors, and the loop continues.
-- After `max_tool_iterations` model calls that still requested tools, the machine runs those tools, then makes one more call with no tools and a temporary reminder (not stored in history). The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted.
+- After `max_tool_iterations` model calls that still requested tools, the machine runs those tools, then makes one more call with no tools and a transient `SystemReminder::ToolLimitReached` appended to that request's history copy only (never stored). The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted.
 - On model failure or a closed event channel the turn returns an error (the thread emits `Error`), and every unanswered tool call in history receives a `failed` result so later requests stay valid.
 
 ### History and names
 
-The thread session owns a `Vec<HistoryItem>` (`User{name}`, `Assistant{content, tool_calls}`, `ToolResult`) that persists across turns. `ModelRequest` carries `system_prompt`, `history`, `tools` (empty when tools are disallowed) and `iteration`.
+The thread session owns a `Vec<HistoryItem>` (`User{name}`, `Assistant{content, tool_calls}`, `ToolResult`, `EnvironmentContext`) that persists across turns; `SystemReminder` only appears in request copies. `ModelRequest` carries `system_prompt`, `history`, `tools` (empty when tools are disallowed) and `iteration`.
 
-- `Op::StartTurn.user_name` becomes `User.name`; it must be non-empty and contain no line breaks, otherwise the thread emits `Error` and history is unchanged.
-- Adapters render user messages with `render_user_content` as `"{name}: {content}"` (a text prefix, not a provider `name` field); consecutive user messages are not merged.
+- `Op::StartTurn.name` becomes `User.name`; it must be non-empty and contain no line breaks, otherwise the thread emits `Error` and history is unchanged.
+- Adapters render user messages with `prompt::render_user` as `"{name}: {content}"` (a text prefix, not a provider `name` field); consecutive user messages are not merged.
 - Assistant items never carry a name. The agent's own name (`ThreadSettings.agent_name`) is appended to the system prompt as `Your name is {name}.`
 - Known limit: user content can imitate the `name:` prefix.
 
 ### Time context
 
-Models have no clock, so `run_turn` appends a nameless `User` history entry before the turn's user message when the date or time zone changed since the last send (design follows Codex `<environment_context>`):
+Models have no clock, so `run_turn` appends a `HistoryItem::EnvironmentContext` before the turn's user message when the date or time zone differs from the baseline (design follows Codex `<environment_context>`):
 
-- The session holds a `ContextState` (`Unsent` / `Sent{date, timezone}` / `Unavailable`). Only changed fields are rendered (`<current_date>`, `<timezone>`); same-day turns send nothing. Detection happens once per turn, not per model call.
+- `EnvironmentContext` is `Available{date, timezone}` or `Unavailable`; every entry is a complete snapshot, and `prompt::render_environment_context` renders it as `<environment_context>` text for the model. The baseline is the last such entry in history (none means nothing sent), so no session state is kept. Same-day turns send nothing; detection happens once per turn, not per model call.
 - Time comes from an injected `Arc<dyn Clock>` (`SystemClock` by default: local date plus IANA zone, falling back to a UTC offset; `FixedClock` for tests).
 - `ThreadSettings.include_time_context` (default on) disables it. Disabling after a send, or a clock failure, appends `<current_date status="unavailable" />` once; a clock failure never fails the turn. Recovery re-sends the full context.
-- It differs from the transient `reminder`: this entry is persisted in history, the reminder only exists in a single request clone.
-- No new `HistoryItem` variant, timestamp field, or event; event order is unchanged.
-- Any wholesale rewrite of history (compaction, rollback, restore) MUST go through `Session::replace_history`, which resets the state to `Unsent` so the next turn re-sends in full.
-- Future persistence: timestamps belong in the storage envelope, not on items; save `ContextState` as its own entry and take the last one as the baseline on load (missing means `Unsent`). Never derive the baseline from envelope timestamps; skip unknown entry types.
+- It differs from `SystemReminder`: this entry is persisted in history, the reminder only exists in a single request clone.
+- No timestamp field or event is added; event order is unchanged.
+- History rewrites (compaction, rollback, restore) need no reset: the baseline follows whatever history remains, so a rewrite that drops the entries re-sends in full and one that keeps them does not.
+- Future persistence: timestamps belong in the storage envelope, not on items. Never derive the baseline from envelope timestamps; skip unknown entry types.
 
 ### Event order
 
@@ -96,7 +120,7 @@ TokenCount
 TurnComplete { finish_reason, last_agent_message }
 ```
 
-All events carry the triggering `SubmissionId`. `ToolCallEnd` carries `status` (`completed`, `failed`, `not_found`) and `duration_ms`.
+All events carry the triggering `SubmissionId`. `ToolCallEnd` carries the `ToolResult` (with `status`: `completed`, `failed`, `not_found`) and `duration_ms`; `ModelRequestCompleted` and `TokenCount` carry `TokenUsage` (the latter summed over the turn).
 
 ```mermaid
 sequenceDiagram
@@ -119,7 +143,7 @@ sequenceDiagram
         opt tool calls
             Loop->>Tools: execute
             Loop-->>Client: ToolCallBegin / ToolCallEnd
-            Loop->>Machine: on_tool_outcomes
+            Loop->>Machine: on_tool_results
         end
     end
     Loop-->>Client: TokenCount
@@ -128,6 +152,7 @@ sequenceDiagram
 
 ### Current limits and next phases
 
+- The genai mapping drops provider metadata such as Gemini `thought_signatures`, which may break multi-call tool use with thinking models; the model protocol needs a provider-metadata field.
 - Turns are serial: `Interrupt` is queued and only handled after the running turn ends; in-turn cancellation is a later phase.
 - History is in memory and unbounded (no compaction).
 - Not yet: streaming output, parallel tools, hooks, approvals, multi-agent messaging.
@@ -137,7 +162,7 @@ sequenceDiagram
 ### Operations (`Op`)
 
 - `Configure` — initialize thread model + system prompt
-- `StartTurn` — run one user turn (optional `user_name`)
+- `StartTurn` — run one user turn (`content`, optional `name`, optional `turn_id`)
 - `Interrupt` — abort the in-flight turn (`TurnAborted` with reason `interrupted`)
 - `ThreadSettings` — apply sparse overrides (`model`, `system_prompt`, `max_tool_iterations`, `agent_name`)
 

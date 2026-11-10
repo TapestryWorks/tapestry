@@ -2,43 +2,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tapestry_protocol::{
-    AgentMessageEvent, Event, EventMsg, ModelRequestCompletedEvent, ModelRequestStartedEvent,
-    SubmissionId, TokenCountEvent, ToolCallBeginEvent, ToolCallEndEvent, ToolCallStatus,
-    TurnCompleteEvent, TurnId, TurnStartedEvent, WarningEvent,
+    AgentMessageEvent, Event, EventMsg, HistoryItem, ModelRequest, ModelRequestCompletedEvent,
+    ModelRequestStartedEvent, SubmissionId, TokenCountEvent, TokenUsage, ToolCall,
+    ToolCallBeginEvent, ToolCallEndEvent, ToolResult, TurnCompleteEvent, TurnId, TurnStartedEvent,
+    TurnStep, WarningEvent,
 };
 use tokio::sync::mpsc;
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
-use crate::context::{next_context_entry, ContextState};
+use crate::context::next_context_entry;
 use crate::error::CoreError;
-use crate::history::{HistoryItem, ToolCall};
-use crate::model::{ModelClient, ModelRequest};
-use crate::tool::{ToolContext, ToolRegistry};
-use crate::turn::{ToolOutcome, TurnMachine, TurnStep};
-
-/// User-side input that starts a turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserInput {
-    pub content: String,
-    pub name: Option<String>,
-}
-
-impl UserInput {
-    pub fn new(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            name: None,
-        }
-    }
-
-    pub fn named(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            name: Some(name.into()),
-        }
-    }
-}
+use crate::model::ModelClient;
+use crate::tool::ToolRegistry;
+use crate::turn::TurnMachine;
 
 /// Drives a [`TurnMachine`]: performs model/tool IO, timing, and event emission.
 pub struct AgentLoop {
@@ -80,34 +57,31 @@ impl AgentLoop {
 
     /// Run one turn. A time-context entry (when due) and the user message are
     /// appended to `history`, which keeps every item produced by the turn (and
-    /// stays valid even on error). `context` tracks what the model was told.
+    /// stays valid even on error).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_turn(
         &self,
         submission_id: SubmissionId,
         turn_id: TurnId,
-        input: UserInput,
+        content: String,
+        name: Option<String>,
         history: &mut Vec<HistoryItem>,
-        context: &mut ContextState,
         config: &ThreadConfig,
         event_tx: &mpsc::Sender<Event>,
     ) -> Result<(), CoreError> {
-        let user_message = input.content.clone();
         if let Some(entry) =
-            next_context_entry(context, config.include_time_context, self.clock.as_ref())
+            next_context_entry(history, config.include_time_context, self.clock.as_ref())
         {
-            history.push(HistoryItem::user(None, entry));
+            history.push(entry.into());
         }
-        history.push(HistoryItem::user(input.name, input.content));
+        history.push(HistoryItem::user(name, content));
         let out = Emitter {
             submission_id,
             tx: event_tx,
         };
         let mut machine = TurnMachine::new(history, config.max_tool_iterations);
 
-        let result = self
-            .drive(&mut machine, turn_id, &user_message, config, &out)
-            .await;
+        let result = self.drive(&mut machine, turn_id, config, &out).await;
         if result.is_err() {
             machine.repair_history();
         }
@@ -118,18 +92,13 @@ impl AgentLoop {
         &self,
         machine: &mut TurnMachine<'_>,
         turn_id: TurnId,
-        user_message: &str,
         config: &ThreadConfig,
         out: &Emitter<'_>,
     ) -> Result<(), CoreError> {
         out.emit(EventMsg::TurnStarted(TurnStartedEvent { turn_id }))
             .await?;
 
-        let mut total_input = 0u32;
-        let mut total_output = 0u32;
-        let ctx = ToolContext {
-            turn_user_message: user_message.to_string(),
-        };
+        let mut total = TokenUsage::default();
 
         let (finish_reason, last_agent_message) = loop {
             match machine.next_step() {
@@ -147,7 +116,7 @@ impl AgentLoop {
 
                     let mut history = machine.history().to_vec();
                     if let Some(reminder) = reminder {
-                        history.push(HistoryItem::user(None, reminder));
+                        history.push(HistoryItem::system_reminder(reminder));
                     }
                     let response = self
                         .model
@@ -162,8 +131,7 @@ impl AgentLoop {
                             iteration,
                         })
                         .await?;
-                    total_input += response.input_tokens;
-                    total_output += response.output_tokens;
+                    total += response.usage;
 
                     if let Some(content) = &response.content {
                         out.emit(EventMsg::AgentMessage(AgentMessageEvent {
@@ -186,19 +154,18 @@ impl AgentLoop {
                     }
 
                     if let TurnStep::RunTools { calls } = machine.next_step() {
-                        let mut outcomes = Vec::with_capacity(calls.len());
+                        let mut results = Vec::with_capacity(calls.len());
                         for call in calls {
-                            outcomes.push(self.run_tool(turn_id, call, &ctx, out).await?);
+                            results.push(self.run_tool(turn_id, call, out).await?);
                         }
-                        machine.on_tool_outcomes(outcomes)?;
+                        machine.on_tool_results(results)?;
                     }
 
                     out.emit(EventMsg::ModelRequestCompleted(
                         ModelRequestCompletedEvent {
                             turn_id,
                             iteration,
-                            input_tokens: response.input_tokens,
-                            output_tokens: response.output_tokens,
+                            usage: response.usage,
                         },
                     ))
                     .await?;
@@ -215,9 +182,7 @@ impl AgentLoop {
 
         out.emit(EventMsg::TokenCount(TokenCountEvent {
             turn_id,
-            input_tokens: total_input,
-            output_tokens: total_output,
-            total_tokens: total_input + total_output,
+            usage: total,
         }))
         .await?;
         out.emit(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -232,52 +197,37 @@ impl AgentLoop {
         &self,
         turn_id: TurnId,
         call: ToolCall,
-        ctx: &ToolContext,
         out: &Emitter<'_>,
-    ) -> Result<ToolOutcome, CoreError> {
+    ) -> Result<ToolResult, CoreError> {
         out.emit(EventMsg::ToolCallBegin(ToolCallBeginEvent {
             turn_id,
-            tool_call_id: call.id,
+            tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             arguments: call.arguments.clone(),
         }))
         .await?;
 
         let started = Instant::now();
-        let (output, status) = match self.tools.get(&call.name) {
+        let result = match self.tools.get(&call.name) {
             Some(tool) => {
-                let result = tool.execute(call.arguments.clone(), ctx).await;
-                let status = if result.success {
-                    ToolCallStatus::Completed
-                } else {
-                    ToolCallStatus::Failed
-                };
-                (result.output, status)
+                let mut result = tool.execute(&call).await;
+                // The call is authoritative; a tool must not re-key its result.
+                result.call_id = call.id.clone();
+                result.tool_name = call.name.clone();
+                result
             }
-            None => (
-                format!("tool `{}` not found", call.name),
-                ToolCallStatus::NotFound,
-            ),
+            None => ToolResult::not_found(&call),
         };
         let duration_ms = started.elapsed().as_millis() as u64;
 
         out.emit(EventMsg::ToolCallEnd(ToolCallEndEvent {
             turn_id,
-            tool_call_id: call.id,
-            tool_name: call.name.clone(),
-            output: output.clone(),
-            success: status == ToolCallStatus::Completed,
-            status,
+            result: result.clone(),
             duration_ms: Some(duration_ms),
         }))
         .await?;
 
-        Ok(ToolOutcome {
-            call_id: call.id,
-            tool_name: call.name,
-            output,
-            status,
-        })
+        Ok(result)
     }
 }
 
@@ -292,8 +242,15 @@ mod tests {
 
     use super::*;
     use crate::clock::FixedClock;
-    use crate::model::{MockModelClient, ModelResponse};
-    use crate::tool::{EchoTool, Tool, ToolResult, ToolSpec};
+    use crate::model::MockModelClient;
+    use crate::tool::{EchoTool, Tool};
+    use tapestry_protocol::{
+        EnvironmentContext, ModelResponse, SystemReminder, ToolCallId, ToolCallStatus, ToolSpec,
+    };
+
+    fn tc(name: &str, arguments: Value) -> ToolCall {
+        ToolCall::new(ToolCallId::generate(), name, arguments)
+    }
 
     /// Replays scripted responses and records every request.
     struct ScriptedModel {
@@ -326,8 +283,11 @@ mod tests {
         Ok(ModelResponse {
             content: content.map(str::to_string),
             tool_calls: calls,
-            input_tokens: 1,
-            output_tokens: 2,
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                ..Default::default()
+            },
         })
     }
 
@@ -345,8 +305,33 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             }
         }
-        async fn execute(&self, _a: Value, _c: &ToolContext) -> ToolResult {
-            ToolResult::failure("nope")
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            ToolResult::failed(call, "nope")
+        }
+    }
+
+    /// Returns a result keyed by an id and name that do not belong to the call.
+    struct MisKeyedTool;
+
+    #[async_trait]
+    impl Tool for MisKeyedTool {
+        fn name(&self) -> &str {
+            "miskeyed"
+        }
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "miskeyed".into(),
+                description: "returns a foreign id".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _call: &ToolCall) -> ToolResult {
+            ToolResult {
+                call_id: ToolCallId::from("foreign"),
+                tool_name: "other".into(),
+                output: "ok".into(),
+                status: ToolCallStatus::Completed,
+            }
         }
     }
 
@@ -354,6 +339,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         registry.register(Arc::new(FailingTool));
+        registry.register(Arc::new(MisKeyedTool));
         Arc::new(registry)
     }
 
@@ -376,9 +362,9 @@ mod tests {
             .run_turn(
                 sid,
                 TurnId::new(),
-                UserInput::new(message),
+                message.into(),
+                None,
                 history,
-                &mut ContextState::default(),
                 &config,
                 &tx,
             )
@@ -407,7 +393,7 @@ mod tests {
                 EventMsg::ModelRequestCompleted(m) => format!("req_done:{}", m.iteration),
                 EventMsg::AgentMessage(_) => "agent_message".into(),
                 EventMsg::ToolCallBegin(_) => "tool_begin".into(),
-                EventMsg::ToolCallEnd(t) => format!("tool_end:{:?}", t.status),
+                EventMsg::ToolCallEnd(t) => format!("tool_end:{:?}", t.result.status),
                 EventMsg::Warning(_) => "warning".into(),
                 EventMsg::TokenCount(_) => "token_count".into(),
                 EventMsg::TurnComplete(_) => "turn_complete".into(),
@@ -477,11 +463,11 @@ mod tests {
             ]
         );
         let (begin, end) = events.iter().fold((None, None), |acc, e| match &e.msg {
-            EventMsg::ToolCallBegin(b) => (Some(b.tool_call_id), acc.1),
-            EventMsg::ToolCallEnd(t) => (acc.0, Some((t.tool_call_id, t.duration_ms))),
+            EventMsg::ToolCallBegin(b) => (Some(b.tool_call_id.clone()), acc.1),
+            EventMsg::ToolCallEnd(t) => (acc.0, Some((t.result.call_id.clone(), t.duration_ms))),
             _ => acc,
         });
-        assert_eq!(begin, end.map(|e| e.0));
+        assert_eq!(begin, end.clone().map(|e| e.0));
         assert!(end.unwrap().1.is_some());
 
         assert!(matches!(history[0], HistoryItem::User { .. }));
@@ -500,8 +486,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_and_failing_tools_are_fed_back() {
-        let ghost = ToolCall::new("ghost", Value::Null);
-        let fail = ToolCall::new("fail", Value::Null);
+        let ghost = tc("ghost", Value::Null);
+        let fail = tc("fail", Value::Null);
         let model = ScriptedModel::new(vec![
             resp(Some("thinking"), vec![ghost.clone(), fail.clone()]),
             resp(Some("recovered"), vec![]),
@@ -537,23 +523,28 @@ mod tests {
         let ends: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.msg {
-                EventMsg::ToolCallEnd(t) => Some((t.tool_call_id, t.success, t.output.clone())),
+                EventMsg::ToolCallEnd(t) => Some((
+                    t.result.call_id.clone(),
+                    t.result.status,
+                    t.result.output.clone(),
+                )),
                 _ => None,
             })
             .collect();
         assert_eq!(ends[0].0, ghost.id);
-        assert!(!ends[0].1 && ends[0].2.contains("ghost"));
+        assert_eq!(ends[0].1, ToolCallStatus::NotFound);
+        assert!(ends[0].2.contains("ghost"));
         assert_eq!(ends[1].0, fail.id);
         assert_eq!(ends[1].2, "nope");
 
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests[1].history.len(), 4);
-        assert_eq!(requests[0].tools.len(), 2);
+        assert_eq!(requests[0].tools.len(), 3);
     }
 
     #[tokio::test]
     async fn exceeding_iterations_forces_tool_free_finish() {
-        let echo = || ToolCall::new("echo", serde_json::json!({"input": "x"}));
+        let echo = || tc("echo", serde_json::json!({"input": "x"}));
         let model = ScriptedModel::new(vec![
             resp(None, vec![echo()]),
             resp(None, vec![echo()]),
@@ -590,10 +581,12 @@ mod tests {
 
         let requests = model.requests.lock().unwrap();
         assert!(requests[2].tools.is_empty());
-        assert!(matches!(
+        assert_eq!(
             requests[2].history.last(),
-            Some(HistoryItem::User { name: None, .. })
-        ));
+            Some(&HistoryItem::system_reminder(
+                SystemReminder::ToolLimitReached
+            ))
+        );
         assert_eq!(requests[2].history.len(), 6);
         // reminder is not persisted
         assert_eq!(history.len(), 6);
@@ -604,6 +597,9 @@ mod tests {
                 .count(),
             1
         );
+        assert!(!history
+            .iter()
+            .any(|i| matches!(i, HistoryItem::SystemReminder(_))));
         assert!(
             matches!(&history[5], HistoryItem::Assistant { content: Some(c), .. } if c == "summary")
         );
@@ -612,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn forced_finish_tool_calls_warn_and_are_ignored() {
         let model = ScriptedModel::new(vec![
-            resp(None, vec![ToolCall::new("echo", Value::Null)]),
-            resp(Some("still"), vec![ToolCall::new("echo", Value::Null)]),
+            resp(None, vec![tc("echo", Value::Null)]),
+            resp(Some("still"), vec![tc("echo", Value::Null)]),
         ]);
         let config = ThreadConfig {
             max_tool_iterations: 1,
@@ -635,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn model_failure_returns_error_and_keeps_history_valid() {
         let model = ScriptedModel::new(vec![
-            resp(None, vec![ToolCall::new("echo", Value::Null)]),
+            resp(None, vec![tc("echo", Value::Null)]),
             Err(CoreError::Model("down".into())),
         ]);
         let mut history = Vec::new();
@@ -648,7 +644,7 @@ mod tests {
             .iter()
             .flat_map(|i| match i {
                 HistoryItem::Assistant { tool_calls, .. } => {
-                    tool_calls.iter().map(|c| c.id).collect()
+                    tool_calls.iter().map(|c| c.id.clone()).collect()
                 }
                 _ => vec![],
             })
@@ -656,7 +652,7 @@ mod tests {
         for id in calls {
             assert!(history
                 .iter()
-                .any(|i| matches!(i, HistoryItem::ToolResult { call_id, .. } if *call_id == id)));
+                .any(|i| matches!(i, HistoryItem::ToolResult(r) if r.call_id == id)));
         }
     }
 
@@ -679,9 +675,9 @@ mod tests {
             .run_turn(
                 SubmissionId::new(),
                 TurnId::new(),
-                UserInput::new("tool:echo"),
+                "tool:echo".into(),
+                None,
                 &mut history,
-                &mut ContextState::default(),
                 &no_time_context(),
                 &tx,
             )
@@ -694,10 +690,7 @@ mod tests {
         let loop_ = AgentLoop::new(
             ScriptedModel::new(vec![resp(
                 None,
-                vec![
-                    ToolCall::new("echo", Value::Null),
-                    ToolCall::new("echo", Value::Null),
-                ],
+                vec![tc("echo", Value::Null), tc("echo", Value::Null)],
             )]),
             registry(),
         );
@@ -713,9 +706,9 @@ mod tests {
             .run_turn(
                 SubmissionId::new(),
                 TurnId::new(),
-                UserInput::new("go"),
+                "go".into(),
+                None,
                 &mut history,
-                &mut ContextState::default(),
                 &no_time_context(),
                 &tx,
             )
@@ -752,7 +745,6 @@ mod tests {
         model: Arc<ScriptedModel>,
         clock: Arc<FixedClock>,
         history: Vec<HistoryItem>,
-        context: ContextState,
         config: ThreadConfig,
     }
 
@@ -765,7 +757,6 @@ mod tests {
                 model,
                 clock,
                 history: Vec::new(),
-                context: ContextState::default(),
                 config: ThreadConfig::default(),
             }
         }
@@ -777,9 +768,9 @@ mod tests {
                 .run_turn(
                     SubmissionId::new(),
                     TurnId::new(),
-                    UserInput::new(message),
+                    message.into(),
+                    None,
                     &mut self.history,
-                    &mut self.context,
                     &self.config,
                     &tx,
                 )
@@ -792,17 +783,21 @@ mod tests {
             (result, events)
         }
 
-        fn context_entries(&self) -> Vec<&str> {
+        fn context_entries(&self) -> Vec<&EnvironmentContext> {
             self.history
                 .iter()
                 .filter_map(|i| match i {
-                    HistoryItem::User {
-                        name: None,
-                        content,
-                    } if content.starts_with("<environment_context>") => Some(content.as_str()),
+                    HistoryItem::EnvironmentContext(context) => Some(context),
                     _ => None,
                 })
                 .collect()
+        }
+    }
+
+    fn available(date: &str, timezone: &str) -> EnvironmentContext {
+        EnvironmentContext::Available {
+            date: date.into(),
+            timezone: timezone.into(),
         }
     }
 
@@ -812,27 +807,18 @@ mod tests {
         let (result, _) = h.turn("hello").await;
         result.unwrap();
         match (&h.history[0], &h.history[1]) {
-            (
-                HistoryItem::User {
-                    name: None,
-                    content: ctx,
-                },
-                HistoryItem::User { content: msg, .. },
-            ) => {
-                assert!(ctx.contains("<current_date>2026-11-04</current_date>"));
-                assert!(ctx.contains("<timezone>Asia/Shanghai</timezone>"));
+            (HistoryItem::EnvironmentContext(ctx), HistoryItem::User { content: msg, .. }) => {
+                assert_eq!(ctx, &available("2026-11-04", "Asia/Shanghai"));
                 assert_eq!(msg, "hello");
             }
             other => panic!("unexpected history: {other:?}"),
         }
         let sent = &h.model.requests.lock().unwrap()[0].history;
-        assert!(
-            matches!(&sent[0], HistoryItem::User { content, .. } if content.contains("environment_context"))
-        );
+        assert!(matches!(&sent[0], HistoryItem::EnvironmentContext(_)));
     }
 
     #[tokio::test]
-    async fn same_day_turn_does_not_resend_and_next_day_adds_date_only() {
+    async fn same_day_turn_does_not_resend_and_next_day_sends_full_snapshot() {
         let mut h = TimeHarness::new(3);
         h.turn("a").await.0.unwrap();
         h.turn("b").await.0.unwrap();
@@ -841,7 +827,7 @@ mod tests {
         h.turn("c").await.0.unwrap();
         let entries = h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert!(entries[1].contains("2026-11-05") && !entries[1].contains("timezone"));
+        assert_eq!(entries[1], &available("2026-11-05", "Asia/Shanghai"));
     }
 
     #[tokio::test]
@@ -864,7 +850,7 @@ mod tests {
         h.turn("c").await.0.unwrap();
         let entries = h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert!(entries[1].contains(r#"status="unavailable""#));
+        assert_eq!(entries[1], &EnvironmentContext::Unavailable);
     }
 
     #[tokio::test]
@@ -880,7 +866,7 @@ mod tests {
         h.turn("c").await.0.unwrap();
         let entries = h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert!(entries[1].contains("current_date") && entries[1].contains("timezone"));
+        assert_eq!(entries[1], &available("2026-11-04", "UTC"));
     }
 
     #[tokio::test]
@@ -893,15 +879,14 @@ mod tests {
         let agent = AgentLoop::with_clock(model, registry(), clock);
         let (tx, _rx) = mpsc::channel(64);
         let mut history = Vec::new();
-        let mut ctx = ContextState::default();
         let config = ThreadConfig::default();
         let first = agent
             .run_turn(
                 SubmissionId::new(),
                 TurnId::new(),
-                UserInput::new("a"),
+                "a".into(),
+                None,
                 &mut history,
-                &mut ctx,
                 &config,
                 &tx,
             )
@@ -912,9 +897,9 @@ mod tests {
             .run_turn(
                 SubmissionId::new(),
                 TurnId::new(),
-                UserInput::new("b"),
+                "b".into(),
+                None,
                 &mut history,
-                &mut ctx,
                 &config,
                 &tx,
             )
@@ -922,7 +907,7 @@ mod tests {
             .unwrap();
         let count = history
             .iter()
-            .filter(|i| matches!(i, HistoryItem::User { content, .. } if content.contains("environment_context")))
+            .filter(|i| matches!(i, HistoryItem::EnvironmentContext(_)))
             .count();
         assert_eq!(count, 1);
     }
@@ -943,5 +928,76 @@ mod tests {
                 "turn_complete"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_result_is_keyed_by_the_original_call() {
+        let call = tc("miskeyed", Value::Null);
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![call.clone()]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut history = Vec::new();
+        let (result, events, _) =
+            run(model, "go", &mut history, &ThreadConfig::default(), 32).await;
+        result.unwrap();
+
+        let end = events
+            .iter()
+            .find_map(|e| match &e.msg {
+                EventMsg::ToolCallEnd(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(end.result.call_id, call.id);
+        assert_eq!(end.result.tool_name, "miskeyed");
+        assert!(history.iter().any(|i| matches!(
+            i,
+            HistoryItem::ToolResult(r) if r.call_id == call.id && r.tool_name == "miskeyed"
+        )));
+        assert_eq!(kinds(&events).last().unwrap(), "turn_complete");
+    }
+
+    #[tokio::test]
+    async fn token_count_sums_usage_across_model_calls() {
+        let usage = |input, output, read, write| TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+        };
+        let reply = |usage, calls| {
+            Ok(ModelResponse {
+                content: None,
+                tool_calls: calls,
+                usage,
+            })
+        };
+        let model = ScriptedModel::new(vec![
+            reply(usage(10, 2, 5, 1), vec![tc("echo", Value::Null)]),
+            reply(usage(20, 3, 7, 0), vec![]),
+        ]);
+        let mut history = Vec::new();
+        let (result, events, _) =
+            run(model, "go", &mut history, &ThreadConfig::default(), 32).await;
+        result.unwrap();
+
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.msg {
+                EventMsg::ModelRequestCompleted(m) => Some(m.usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, [usage(10, 2, 5, 1), usage(20, 3, 7, 0)]);
+        let total = events
+            .iter()
+            .find_map(|e| match &e.msg {
+                EventMsg::TokenCount(t) => Some(t.usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(total, usage(30, 5, 12, 1));
+        assert_eq!(total.total_tokens(), 48);
     }
 }

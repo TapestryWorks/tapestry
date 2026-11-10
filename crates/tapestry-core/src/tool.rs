@@ -3,51 +3,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-
-/// Description of a tool exposed to the model.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    /// JSON Schema describing the arguments.
-    pub parameters: Value,
-}
-
-/// Result of executing a tool. Failures are expressed with `success: false`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
-    pub output: String,
-    pub success: bool,
-}
-
-impl ToolResult {
-    pub fn success(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            success: true,
-        }
-    }
-
-    pub fn failure(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            success: false,
-        }
-    }
-}
-
-/// Execution context available to tools during a turn.
-#[derive(Debug, Clone, Default)]
-pub struct ToolContext {
-    pub turn_user_message: String,
-}
+use tapestry_protocol::{ToolCall, ToolResult, ToolSpec};
 
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn spec(&self) -> ToolSpec;
     /// Always returns a result; failures must not be surfaced as errors.
-    async fn execute(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;
+    /// Build it with `ToolResult::completed/failed(call, ..)`; the agent loop
+    /// overwrites `call_id` and `tool_name` with those of `call`.
+    async fn execute(&self, call: &ToolCall) -> ToolResult;
 }
 
 /// Registry of tools available to the agent loop.
@@ -70,10 +35,47 @@ impl ToolRegistry {
     }
 
     /// Specs of all registered tools, sorted by name for deterministic requests.
+    /// Each schema is extended with a required `description` argument that
+    /// states why the model is calling the tool.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs: Vec<ToolSpec> = self.tools.values().map(|tool| tool.spec()).collect();
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .map(|tool| {
+                let mut spec = tool.spec();
+                require_call_description(&mut spec.parameters);
+                spec
+            })
+            .collect();
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
+    }
+}
+
+/// Adds a required string `description` property to an object schema.
+/// A tool-defined `description` property is kept; non-object schemas are untouched.
+fn require_call_description(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    let properties = obj
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.entry("description").or_insert_with(|| {
+            serde_json::json!({
+                "type": "string",
+                "description": "Why this tool is being called.",
+            })
+        });
+    }
+    let required = obj
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(required) = required.as_array_mut() {
+        if !required.iter().any(|v| v == "description") {
+            required.push(Value::String("description".into()));
+        }
     }
 }
 
@@ -98,19 +100,25 @@ impl Tool for EchoTool {
         }
     }
 
-    async fn execute(&self, arguments: Value, _ctx: &ToolContext) -> ToolResult {
-        let input = arguments
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let input = call
+            .arguments
             .get("input")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        ToolResult::success(input)
+            .unwrap_or("");
+        ToolResult::completed(call, input)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tapestry_protocol::{ToolCallId, ToolCallStatus};
+
     use super::*;
+
+    fn call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall::new(ToolCallId::generate(), name, arguments)
+    }
 
     struct NamedTool(&'static str);
 
@@ -126,29 +134,25 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             }
         }
-        async fn execute(&self, _arguments: Value, _ctx: &ToolContext) -> ToolResult {
-            ToolResult::failure("boom")
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            ToolResult::failed(call, "boom")
         }
     }
 
     #[tokio::test]
     async fn echo_tool_returns_input() {
-        let result = EchoTool
-            .execute(
-                serde_json::json!({"input": "ping"}),
-                &ToolContext::default(),
-            )
-            .await;
+        let call = call("echo", serde_json::json!({"input": "ping"}));
+        let result = EchoTool.execute(&call).await;
         assert_eq!(result.output, "ping");
-        assert!(result.success);
+        assert_eq!(result.status, ToolCallStatus::Completed);
+        assert_eq!(result.call_id, call.id);
+        assert_eq!(result.tool_name, "echo");
     }
 
     #[tokio::test]
     async fn failure_is_a_result_not_an_error() {
-        let result = NamedTool("x")
-            .execute(Value::Null, &ToolContext::default())
-            .await;
-        assert!(!result.success);
+        let result = NamedTool("x").execute(&call("x", Value::Null)).await;
+        assert_eq!(result.status, ToolCallStatus::Failed);
         assert_eq!(result.output, "boom");
     }
 
@@ -165,6 +169,50 @@ mod tests {
         registry.register(Arc::new(EchoTool));
         assert!(registry.get("echo").is_some());
         assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn registry_specs_require_description() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(NamedTool("bare")));
+        for spec in registry.specs() {
+            assert_eq!(
+                spec.parameters["properties"]["description"]["type"],
+                "string"
+            );
+            let required = spec.parameters["required"].as_array().unwrap();
+            assert_eq!(required.iter().filter(|v| *v == "description").count(), 1);
+        }
+        let echo = registry
+            .specs()
+            .into_iter()
+            .find(|s| s.name == "echo")
+            .unwrap();
+        assert_eq!(
+            echo.parameters["required"],
+            serde_json::json!(["input", "description"])
+        );
+        // The tool's own spec is unchanged.
+        assert!(EchoTool.spec().parameters["properties"]
+            .get("description")
+            .is_none());
+    }
+
+    #[test]
+    fn require_description_skips_non_object_and_keeps_custom() {
+        let mut schema = serde_json::json!(true);
+        require_call_description(&mut schema);
+        assert_eq!(schema, serde_json::json!(true));
+
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {"description": {"type": "string", "description": "custom"}},
+            "required": ["description"],
+        });
+        require_call_description(&mut schema);
+        assert_eq!(schema["properties"]["description"]["description"], "custom");
+        assert_eq!(schema["required"], serde_json::json!(["description"]));
     }
 
     #[test]

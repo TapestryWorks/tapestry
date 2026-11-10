@@ -7,7 +7,7 @@
 ## Requirements
 
 ### Requirement: 回合开始时注入时间上下文
-当时间上下文开启时，线程 SHALL 在每个回合开始、写入用户消息之前，比较当前日期/时区与上次已发送的内容；若不同或从未发送，MUST 向 history 追加一条无名称的用户侧条目，且该条目位于本回合用户消息之前。
+当时间上下文开启时，线程 SHALL 在每个回合开始、写入用户消息之前，比较当前日期和时区与 history 中最后一条环境上下文条目。若两者不同，或 history 中没有环境上下文条目，MUST 向 history 追加一条环境上下文条目，且该条目位于本回合用户消息之前。
 
 #### Scenario: 线程首个回合
 - **WHEN** 开启时间上下文的线程执行第一个回合
@@ -17,30 +17,34 @@
 - **WHEN** 日期与时区均未变化，线程执行下一个回合
 - **THEN** 不追加新的时间上下文条目
 
-### Requirement: 仅在变化时增量发送
-时间上下文 SHALL 仅包含相对上次已发送内容发生变化的字段；日期按本地日历日（`YYYY-MM-DD`）比较，同一日历日内的不同时刻 MUST NOT 触发重发。
+### Requirement: 变化时发送完整快照
+每条可用的环境上下文条目 SHALL 同时包含完整的日期与时区。日期或时区任一变化时，新条目 MUST 包含二者的当前值。日期按本地日历日（`YYYY-MM-DD`）比较，同一日历日内的不同时刻 MUST NOT 触发重发。
 
 #### Scenario: 跨日
 - **WHEN** 两个回合之间本地日期由 `2026-11-04` 变为 `2026-11-05`，时区不变
-- **THEN** 新条目仅包含 `current_date` 为 `2026-11-05`，不含 `timezone`
+- **THEN** 新条目包含 `current_date` 为 `2026-11-05`，以及不变的 `timezone`
 
 #### Scenario: 时区变化
 - **WHEN** 本地时区变化而日期不变
-- **THEN** 新条目仅包含新的 `timezone`
+- **THEN** 新条目包含新的 `timezone` 与当前 `current_date`
 
 ### Requirement: 时间上下文渲染格式
-时间上下文条目 SHALL 渲染为 `<environment_context>` 包裹的片段，日期以 `<current_date>` 表示、时区以 `<timezone>` 表示；时区 SHALL 优先使用 IANA 名称，无法获取时回退为 UTC 偏移。
+时间上下文条目在发送给模型时 SHALL 渲染为 `<environment_context>` 包裹的片段，日期以 `<current_date>` 表示，时区以 `<timezone>` 表示。不可用条目渲染为 `<current_date status="unavailable" />`。时区 SHALL 优先使用 IANA 名称，无法获取时回退为 UTC 偏移。
 
 #### Scenario: 完整片段
-- **WHEN** 首次发送日期 `2026-11-05`、时区 `Asia/Shanghai`
-- **THEN** 条目文本包含 `<environment_context>`、`<current_date>2026-11-05</current_date>`、`<timezone>Asia/Shanghai</timezone>` 及对应结束标签
+- **WHEN** 发送日期为 `2026-11-05`、时区为 `Asia/Shanghai` 的条目
+- **THEN** 渲染文本包含 `<environment_context>`、`<current_date>2026-11-05</current_date>`、`<timezone>Asia/Shanghai</timezone>` 及对应的结束标签
 
 #### Scenario: IANA 名称不可用
 - **WHEN** 系统无法提供 IANA 时区名称
 - **THEN** `timezone` 使用 UTC 偏移（如 `+08:00`）
 
+#### Scenario: 不可用条目
+- **WHEN** 发送一条不可用的环境上下文条目
+- **THEN** 渲染文本包含 `<current_date status="unavailable" />`
+
 ### Requirement: 默认开启且可关闭
-时间上下文 SHALL 默认开启；客户端 MUST 能通过线程设置关闭。关闭时系统 MUST NOT 读取时钟或追加时间上下文条目。若此前已发送过日期而后被关闭，下一回合 SHALL 追加一条表示日期不可用的条目（`<current_date status="unavailable" />`），之后不再重复。
+时间上下文 SHALL 默认开启；客户端 MUST 能通过线程设置关闭。关闭时系统 MUST NOT 读取时钟或追加可用的时间上下文条目。如果 history 中最后一条环境上下文条目是可用状态，关闭后的下一回合 SHALL 追加一条不可用条目，之后不再重复追加。
 
 #### Scenario: 默认配置
 - **WHEN** 线程未设置该开关
@@ -70,14 +74,18 @@
 - **THEN** 下一回合追加完整的 `current_date` 与 `timezone`
 
 ### Requirement: history 前缀被改写后完整重发
-任何改写或截断 history 前缀的操作（包括未来的压缩、回滚、从存储恢复）MUST 同时使已发送的时间上下文失效，使下一回合重新发送完整的日期与时区。
+已发送的基线 SHALL 只由当前 history 推导，不另行保存状态。history 被改写或截断（包括压缩、回滚、从存储恢复）后，如果保留下来的 history 中没有环境上下文条目，下一回合 MUST 追加完整的日期与时区；如果仍有，则以其中最后一条作为基线。
 
 #### Scenario: 替换 history
-- **WHEN** 会话 history 被整体替换
+- **WHEN** 会话 history 被整体替换为不含环境上下文条目的内容
 - **THEN** 下一回合追加完整的 `current_date` 与 `timezone`，即使日期与此前相同
 
-### Requirement: 时间上下文不改变事件与 history 条目类型
-时间上下文条目 SHALL 作为普通用户侧条目存在，MUST NOT 新增 history 条目类型，MUST NOT 为 history 条目增加时间戳字段，也 MUST NOT 新增事件或改变既有事件顺序。
+#### Scenario: 替换为含上下文的 history
+- **WHEN** 会话 history 被替换为以当前日期和时区的环境上下文条目作为最后一条该类条目的内容
+- **THEN** 下一回合不追加新的时间上下文条目
+
+### Requirement: 时间上下文是独立的 history 条目类型
+时间上下文 SHALL 以独立的环境上下文条目类型存在于 history 中，取值为“可用（日期、时区）”或“不可用”。它 MUST NOT 为其他 history 条目增加时间戳字段，也 MUST NOT 新增事件或改变既有事件顺序。
 
 #### Scenario: 事件序列不变
 - **WHEN** 回合注入了时间上下文条目

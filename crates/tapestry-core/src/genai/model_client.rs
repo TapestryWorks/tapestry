@@ -6,7 +6,8 @@ use crate::genai::mapping::{
     chat_response_to_model_response, map_genai_error, model_request_to_chat_request,
 };
 use crate::genai::service::GenaiChatService;
-use crate::model::{ModelClient, ModelRequest, ModelResponse};
+use crate::model::ModelClient;
+use tapestry_protocol::{ModelRequest, ModelResponse};
 
 /// [`ModelClient`] backed by the [`genai`](https://crates.io/crates/genai) crate.
 #[derive(Clone)]

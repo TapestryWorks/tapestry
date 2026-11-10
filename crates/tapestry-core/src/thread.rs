@@ -8,14 +8,13 @@ use tapestry_protocol::{
     TurnAbortReason, TurnAbortedEvent, TurnId,
 };
 
-use crate::agent::{AgentLoop, UserInput};
+use crate::agent::AgentLoop;
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
-use crate::context::ContextState;
 use crate::error::CoreError;
-use crate::history::HistoryItem;
 use crate::model::ModelClient;
 use crate::tool::ToolRegistry;
+use tapestry_protocol::HistoryItem;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 
@@ -27,29 +26,24 @@ struct Session {
     active_turn: Option<TurnId>,
     /// Kept across turns; in-memory only and unbounded.
     history: Vec<HistoryItem>,
-    /// What the model has been told about the date/time zone.
-    context: ContextState,
 }
 
 impl Session {
     /// The only way to rewrite history wholesale (compaction, rollback, restore).
-    /// Invalidates the sent time context so the next turn re-sends it in full.
+    /// The time-context baseline is derived from history, so nothing else resets.
     #[allow(dead_code)]
     fn replace_history(&mut self, history: Vec<HistoryItem>) {
         self.history = history;
-        self.context = ContextState::Unsent;
     }
 }
 
 fn validate_user_name(name: &str) -> Result<(), CoreError> {
     if name.trim().is_empty() {
-        return Err(CoreError::InvalidInput(
-            "user_name must not be empty".into(),
-        ));
+        return Err(CoreError::InvalidInput("name must not be empty".into()));
     }
     if name.contains(['\n', '\r']) {
         return Err(CoreError::InvalidInput(
-            "user_name must not contain line breaks".into(),
+            "name must not contain line breaks".into(),
         ));
     }
     Ok(())
@@ -235,9 +229,9 @@ async fn process_submission(
                 .map_err(|_| CoreError::ChannelClosed)?;
         }
         Op::StartTurn {
-            user_message,
+            content,
+            name,
             turn_id,
-            user_name,
         } => {
             if !session.configured {
                 return Err(CoreError::NotConfigured);
@@ -245,7 +239,7 @@ async fn process_submission(
             if session.active_turn.is_some() {
                 return Err(CoreError::TurnInProgress);
             }
-            if let Some(name) = &user_name {
+            if let Some(name) = &name {
                 validate_user_name(name)?;
             }
 
@@ -256,12 +250,9 @@ async fn process_submission(
                 .run_turn(
                     submission.id,
                     turn_id,
-                    UserInput {
-                        content: user_message,
-                        name: user_name,
-                    },
+                    content,
+                    name,
                     &mut session.history,
-                    &mut session.context,
                     &session.config,
                     event_tx,
                 )
@@ -311,9 +302,9 @@ mod tests {
 
         let turn_id = handle
             .submit(Op::StartTurn {
-                user_message: "hello".into(),
+                content: "hello".into(),
+                name: None,
                 turn_id: None,
-                user_name: None,
             })
             .await
             .unwrap();
@@ -333,9 +324,9 @@ mod tests {
 
         let turn_id = handle
             .submit(Op::StartTurn {
-                user_message: "hello".into(),
+                content: "hello".into(),
+                name: None,
                 turn_id: None,
-                user_name: None,
             })
             .await
             .unwrap();
@@ -373,9 +364,9 @@ mod tests {
     async fn turn(handle: &ThreadHandle, msg: &str, user_name: Option<&str>) -> Vec<Event> {
         let id = handle
             .submit(Op::StartTurn {
-                user_message: msg.into(),
+                content: msg.into(),
+                name: user_name.map(str::to_string),
                 turn_id: None,
-                user_name: user_name.map(str::to_string),
             })
             .await
             .unwrap();
@@ -399,13 +390,12 @@ mod tests {
     impl ModelClient for HistoryCountModel {
         async fn complete(
             &self,
-            request: crate::model::ModelRequest,
-        ) -> Result<crate::model::ModelResponse, CoreError> {
-            Ok(crate::model::ModelResponse {
+            request: tapestry_protocol::ModelRequest,
+        ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
+            Ok(tapestry_protocol::ModelResponse {
                 content: Some(format!("items={}", request.history.len())),
                 tool_calls: vec![],
-                input_tokens: 0,
-                output_tokens: 0,
+                usage: Default::default(),
             })
         }
     }
@@ -462,13 +452,12 @@ mod tests {
         impl ModelClient for PromptModel {
             async fn complete(
                 &self,
-                request: crate::model::ModelRequest,
-            ) -> Result<crate::model::ModelResponse, CoreError> {
-                Ok(crate::model::ModelResponse {
+                request: tapestry_protocol::ModelRequest,
+            ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
+                Ok(tapestry_protocol::ModelResponse {
                     content: request.system_prompt,
                     tool_calls: vec![],
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    usage: Default::default(),
                 })
             }
         }
@@ -500,18 +489,17 @@ mod tests {
         impl ModelClient for ContextCountModel {
             async fn complete(
                 &self,
-                request: crate::model::ModelRequest,
-            ) -> Result<crate::model::ModelResponse, CoreError> {
+                request: tapestry_protocol::ModelRequest,
+            ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
                 let n = request
                     .history
                     .iter()
-                    .filter(|i| matches!(i, HistoryItem::User { content, .. } if content.contains("environment_context")))
+                    .filter(|i| matches!(i, HistoryItem::EnvironmentContext(_)))
                     .count();
-                Ok(crate::model::ModelResponse {
+                Ok(tapestry_protocol::ModelResponse {
                     content: Some(n.to_string()),
                     tool_calls: vec![],
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    usage: Default::default(),
                 })
             }
         }
@@ -543,17 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn replace_history_resets_context_so_next_turn_resends() {
-        use crate::clock::FixedClock;
-        use crate::context::next_context_entry;
-
-        let clock = FixedClock::new("2026-11-05", "UTC");
+    fn replace_history_replaces_without_other_state() {
         let mut session = Session::default();
-        assert!(next_context_entry(&mut session.context, true, &clock).is_some());
-        assert!(next_context_entry(&mut session.context, true, &clock).is_none());
+        session.history.push(HistoryItem::user(None, "old"));
+        session.replace_history(vec![HistoryItem::user(None, "new")]);
+        assert_eq!(session.history, vec![HistoryItem::user(None, "new")]);
         session.replace_history(Vec::new());
         assert!(session.history.is_empty());
-        let text = next_context_entry(&mut session.context, true, &clock).unwrap();
-        assert!(text.contains("current_date") && text.contains("timezone"));
     }
 }

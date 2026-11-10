@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::event::ThreadSettings;
+use super::event::ThreadSettings;
 use crate::ids::{SubmissionId, TurnId};
 
 /// Submission Queue entry — a request from the client to the agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
-    /// Correlates with [`crate::event::Event`] responses.
+    /// Correlates with [`super::Event`] responses.
     pub id: SubmissionId,
     pub op: Op,
 }
@@ -38,12 +38,12 @@ pub enum Op {
     },
     /// Start processing user input for a turn.
     StartTurn {
-        user_message: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<TurnId>,
+        content: String,
         /// Speaker name for multi-agent scenarios.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        user_name: Option<String>,
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
     },
     /// Abort the in-flight turn without shutting down the thread.
     Interrupt,
@@ -61,9 +61,9 @@ mod tests {
         let submission = Submission::with_id(
             SubmissionId::new(),
             Op::StartTurn {
-                user_message: "hello".into(),
+                content: "hello".into(),
+                name: Some("alice".into()),
                 turn_id: None,
-                user_name: Some("alice".into()),
             },
         );
         let json = serde_json::to_string(&submission).unwrap();
@@ -72,16 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn start_turn_without_user_name_is_omitted_and_parses() {
+    fn start_turn_without_name_is_omitted_and_parses() {
         let op = Op::StartTurn {
-            user_message: "hi".into(),
+            content: "hi".into(),
+            name: None,
             turn_id: None,
-            user_name: None,
         };
         let json = serde_json::to_string(&op).unwrap();
-        assert!(!json.contains("user_name"));
-        let decoded: Op =
-            serde_json::from_str(r#"{"type":"start_turn","user_message":"hi"}"#).unwrap();
+        assert!(!json.contains("name"));
+        let decoded: Op = serde_json::from_str(r#"{"type":"start_turn","content":"hi"}"#).unwrap();
         assert_eq!(op, decoded);
     }
 

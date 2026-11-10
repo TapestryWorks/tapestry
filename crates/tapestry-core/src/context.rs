@@ -1,103 +1,44 @@
-//! Time context injected into history as a persistent `<environment_context>` entry.
+//! Decides when an [`EnvironmentContext`] entry is appended to history.
 //!
-//! Unlike the per-request `reminder`, the entry is written into history and only
-//! re-sent when the date or time zone changes.
+//! The baseline is the last `EnvironmentContext` already in history, so
+//! rewriting history needs no extra bookkeeping. Every entry is a complete
+//! snapshot.
 
-use serde::{Deserialize, Serialize};
+use tapestry_protocol::{EnvironmentContext, HistoryItem};
 
-use crate::clock::{Clock, ClockReading};
+use crate::clock::Clock;
 
-/// What the model has already been told about the date and time zone.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum ContextState {
-    /// Nothing sent yet, or history was rewritten: the next send is complete.
-    #[default]
-    Unsent,
-    Sent {
-        date: String,
-        timezone: String,
-    },
-    /// The model was told the date is unavailable.
-    Unavailable,
-}
-
-/// Decide whether a context entry is needed this turn.
-///
-/// Returns the text to append to history (if any) and updates `state` accordingly.
+/// Return the entry to append this turn, if any.
 pub fn next_context_entry(
-    state: &mut ContextState,
+    history: &[HistoryItem],
     enabled: bool,
     clock: &dyn Clock,
-) -> Option<String> {
+) -> Option<EnvironmentContext> {
+    let baseline = history.iter().rev().find_map(|item| match item {
+        HistoryItem::EnvironmentContext(context) => Some(context),
+        _ => None,
+    });
+
     if !enabled {
-        return match state {
-            ContextState::Sent { .. } => {
-                *state = ContextState::Unavailable;
-                Some(render_unavailable())
-            }
+        return match baseline {
+            Some(EnvironmentContext::Available { .. }) => Some(EnvironmentContext::Unavailable),
             _ => None,
         };
     }
 
     match clock.now() {
-        Ok(reading) => diff_reading(state, reading),
-        Err(_) => match state {
-            ContextState::Unavailable => None,
-            _ => {
-                *state = ContextState::Unavailable;
-                Some(render_unavailable())
-            }
+        Ok(reading) => {
+            let current = EnvironmentContext::Available {
+                date: reading.local_date,
+                timezone: reading.timezone,
+            };
+            (baseline != Some(&current)).then_some(current)
+        }
+        Err(_) => match baseline {
+            Some(EnvironmentContext::Unavailable) => None,
+            _ => Some(EnvironmentContext::Unavailable),
         },
     }
-}
-
-fn diff_reading(state: &mut ContextState, reading: ClockReading) -> Option<String> {
-    let ClockReading {
-        local_date,
-        timezone,
-    } = reading;
-    let (date, tz) = match state {
-        ContextState::Sent {
-            date: old_date,
-            timezone: old_tz,
-        } => {
-            let date_changed = *old_date != local_date;
-            let tz_changed = *old_tz != timezone;
-            if !date_changed && !tz_changed {
-                return None;
-            }
-            (
-                date_changed.then_some(local_date.as_str()),
-                tz_changed.then_some(timezone.as_str()),
-            )
-        }
-        _ => (Some(local_date.as_str()), Some(timezone.as_str())),
-    };
-    let text = render_context(date, tz);
-    *state = ContextState::Sent {
-        date: local_date,
-        timezone,
-    };
-    Some(text)
-}
-
-/// Render an `<environment_context>` fragment with only the given fields.
-pub fn render_context(date: Option<&str>, timezone: Option<&str>) -> String {
-    let mut out = String::from("<environment_context>\n");
-    if let Some(date) = date {
-        out.push_str(&format!("  <current_date>{date}</current_date>\n"));
-    }
-    if let Some(timezone) = timezone {
-        out.push_str(&format!("  <timezone>{timezone}</timezone>\n"));
-    }
-    out.push_str("</environment_context>");
-    out
-}
-
-pub fn render_unavailable() -> String {
-    "<environment_context>\n  <current_date status=\"unavailable\" />\n</environment_context>"
-        .to_string()
 }
 
 #[cfg(test)]
@@ -105,112 +46,125 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
 
-    fn step(state: &mut ContextState, enabled: bool, clock: &FixedClock) -> Option<String> {
-        next_context_entry(state, enabled, clock)
-    }
-
-    #[test]
-    fn first_send_is_complete_and_exact() {
-        let clock = FixedClock::new("2026-11-05", "Asia/Shanghai");
-        let mut state = ContextState::Unsent;
-        let text = step(&mut state, true, &clock).unwrap();
-        assert_eq!(
-            text,
-            "<environment_context>\n  <current_date>2026-11-05</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"
-        );
-        assert_eq!(
-            state,
-            ContextState::Sent {
-                date: "2026-11-05".into(),
-                timezone: "Asia/Shanghai".into()
-            }
-        );
-    }
-
-    #[test]
-    fn same_day_is_not_resent() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        let mut state = ContextState::Unsent;
-        assert!(step(&mut state, true, &clock).is_some());
-        assert!(step(&mut state, true, &clock).is_none());
-    }
-
-    #[test]
-    fn new_day_sends_only_date() {
-        let clock = FixedClock::new("2026-11-04", "UTC");
-        let mut state = ContextState::Unsent;
-        step(&mut state, true, &clock);
-        clock.set("2026-11-05", "UTC");
-        let text = step(&mut state, true, &clock).unwrap();
-        assert!(text.contains("<current_date>2026-11-05</current_date>"));
-        assert!(!text.contains("timezone"));
-    }
-
-    #[test]
-    fn timezone_change_sends_only_timezone() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        let mut state = ContextState::Unsent;
-        step(&mut state, true, &clock);
-        clock.set("2026-11-05", "Asia/Shanghai");
-        let text = step(&mut state, true, &clock).unwrap();
-        assert!(text.contains("<timezone>Asia/Shanghai</timezone>"));
-        assert!(!text.contains("current_date"));
-    }
-
-    #[test]
-    fn unavailable_is_deduplicated_and_recovers_with_full_send() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        let mut state = ContextState::Unsent;
-        step(&mut state, true, &clock);
-        clock.fail();
-        let text = step(&mut state, true, &clock).unwrap();
-        assert_eq!(text, render_unavailable());
-        assert!(text.contains(r#"<current_date status="unavailable" />"#));
-        assert!(step(&mut state, true, &clock).is_none());
-        clock.set("2026-11-05", "UTC");
-        let text = step(&mut state, true, &clock).unwrap();
-        assert!(text.contains("current_date") && text.contains("timezone"));
-    }
-
-    #[test]
-    fn clock_failure_on_first_turn_sends_unavailable() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        clock.fail();
-        let mut state = ContextState::Unsent;
-        assert_eq!(step(&mut state, true, &clock), Some(render_unavailable()));
-        assert_eq!(state, ContextState::Unavailable);
-    }
-
-    #[test]
-    fn disabled_never_sent_emits_nothing_and_skips_clock() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        clock.fail();
-        let mut state = ContextState::Unsent;
-        assert!(step(&mut state, false, &clock).is_none());
-        assert_eq!(state, ContextState::Unsent);
-    }
-
-    #[test]
-    fn disabled_after_sent_emits_unavailable_once() {
-        let clock = FixedClock::new("2026-11-05", "UTC");
-        let mut state = ContextState::Unsent;
-        step(&mut state, true, &clock);
-        assert_eq!(step(&mut state, false, &clock), Some(render_unavailable()));
-        assert!(step(&mut state, false, &clock).is_none());
-    }
-
-    #[test]
-    fn state_serde_roundtrip() {
-        for state in [
-            ContextState::Unsent,
-            ContextState::Unavailable,
-            ContextState::Sent {
-                date: "2026-11-05".into(),
-                timezone: "UTC".into(),
-            },
-        ] {
-            let json = serde_json::to_string(&state).unwrap();
-            assert_eq!(serde_json::from_str::<ContextState>(&json).unwrap(), state);
+    fn available(date: &str, tz: &str) -> EnvironmentContext {
+        EnvironmentContext::Available {
+            date: date.into(),
+            timezone: tz.into(),
         }
+    }
+
+    fn with(context: Option<EnvironmentContext>) -> Vec<HistoryItem> {
+        let mut history = vec![HistoryItem::user(None, "earlier")];
+        history.extend(context.map(HistoryItem::from));
+        history.push(HistoryItem::user(None, "later"));
+        history
+    }
+
+    fn working() -> FixedClock {
+        FixedClock::new("2026-11-05", "UTC")
+    }
+
+    fn failing() -> FixedClock {
+        let clock = working();
+        clock.fail();
+        clock
+    }
+
+    fn next(
+        baseline: Option<EnvironmentContext>,
+        enabled: bool,
+        clock: &FixedClock,
+    ) -> Option<EnvironmentContext> {
+        next_context_entry(&with(baseline), enabled, clock)
+    }
+
+    #[test]
+    fn no_baseline() {
+        assert_eq!(next(None, false, &failing()), None);
+        assert_eq!(
+            next(None, true, &working()),
+            Some(available("2026-11-05", "UTC"))
+        );
+        assert_eq!(
+            next(None, true, &failing()),
+            Some(EnvironmentContext::Unavailable)
+        );
+    }
+
+    #[test]
+    fn available_baseline() {
+        let base = || Some(available("2026-11-05", "UTC"));
+        assert_eq!(
+            next(base(), false, &working()),
+            Some(EnvironmentContext::Unavailable)
+        );
+        assert_eq!(next(base(), true, &working()), None);
+        assert_eq!(
+            next(base(), true, &FixedClock::new("2026-11-06", "UTC")),
+            Some(available("2026-11-06", "UTC"))
+        );
+        assert_eq!(
+            next(
+                base(),
+                true,
+                &FixedClock::new("2026-11-05", "Asia/Shanghai")
+            ),
+            Some(available("2026-11-05", "Asia/Shanghai"))
+        );
+        assert_eq!(
+            next(base(), true, &failing()),
+            Some(EnvironmentContext::Unavailable)
+        );
+    }
+
+    #[test]
+    fn unavailable_baseline() {
+        let base = || Some(EnvironmentContext::Unavailable);
+        assert_eq!(next(base(), false, &working()), None);
+        assert_eq!(
+            next(base(), true, &working()),
+            Some(available("2026-11-05", "UTC"))
+        );
+        assert_eq!(next(base(), true, &failing()), None);
+    }
+
+    #[test]
+    fn last_entry_is_the_baseline() {
+        let history = vec![
+            available("2026-11-04", "UTC").into(),
+            available("2026-11-05", "UTC").into(),
+            HistoryItem::user(None, "x"),
+        ];
+        assert_eq!(next_context_entry(&history, true, &working()), None);
+    }
+
+    #[test]
+    fn replaced_history_without_context_resends_in_full() {
+        assert_eq!(
+            next_context_entry(&[], true, &working()),
+            Some(available("2026-11-05", "UTC"))
+        );
+    }
+
+    #[test]
+    fn replaced_history_with_context_does_not_resend() {
+        let history = vec![available("2026-11-05", "UTC").into()];
+        assert_eq!(next_context_entry(&history, true, &working()), None);
+    }
+
+    #[test]
+    fn new_day_sends_full_snapshot() {
+        let history = vec![available("2026-11-04", "Asia/Shanghai").into()];
+        let clock = FixedClock::new("2026-11-05", "Asia/Shanghai");
+        assert_eq!(
+            next_context_entry(&history, true, &clock),
+            Some(available("2026-11-05", "Asia/Shanghai"))
+        );
+    }
+
+    #[test]
+    fn disabled_skips_the_clock() {
+        // A failing clock must not matter when disabled.
+        assert_eq!(next(None, false, &failing()), None);
     }
 }

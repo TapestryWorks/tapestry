@@ -49,7 +49,42 @@ macro_rules! id_type {
 id_type!(ThreadId);
 id_type!(TurnId);
 id_type!(SubmissionId);
-id_type!(ToolCallId);
+
+/// Opaque tool call identifier, normally issued by the model provider.
+///
+/// Never parse it: its format is provider-defined.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolCallId(String);
+
+impl ToolCallId {
+    /// Fallback for providers that give no id; `call_` plus a simple UUID.
+    pub fn generate() -> Self {
+        Self(format!("call_{}", Uuid::new_v4().simple()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ToolCallId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
+impl From<&str> for ToolCallId {
+    fn from(id: &str) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl fmt::Display for ToolCallId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -68,5 +103,25 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let decoded: TurnId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn tool_call_id_serializes_transparently() {
+        let id = ToolCallId::from("call_abc");
+        assert_eq!(serde_json::to_string(&id).unwrap(), r#""call_abc""#);
+        assert_eq!(
+            serde_json::from_str::<ToolCallId>(r#""call_abc""#).unwrap(),
+            id
+        );
+        assert_eq!(id.as_str(), "call_abc");
+        assert_eq!(id.to_string(), "call_abc");
+    }
+
+    #[test]
+    fn generated_tool_call_ids_are_prefixed_and_distinct() {
+        let a = ToolCallId::generate();
+        let b = ToolCallId::generate();
+        assert!(a.as_str().starts_with("call_") && a.as_str().len() > "call_".len());
+        assert_ne!(a, b);
     }
 }
