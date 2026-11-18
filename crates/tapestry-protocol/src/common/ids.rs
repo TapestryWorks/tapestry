@@ -49,6 +49,9 @@ macro_rules! id_type {
 id_type!(ThreadId);
 id_type!(TurnId);
 id_type!(SubmissionId);
+// Identifies the assistant message produced by one model output; links its
+// start, delta and final events.
+id_type!(MessageId);
 
 /// Opaque tool call identifier, normally issued by the model provider.
 ///
@@ -103,6 +106,17 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let decoded: TurnId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn message_id_behaves_like_other_ids() {
+        let id = MessageId::new();
+        assert_ne!(id, MessageId::new());
+        let parsed: MessageId = id.to_string().parse().expect("parse");
+        assert_eq!(parsed, id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(serde_json::from_str::<MessageId>(&json).unwrap(), id);
     }
 
     #[test]

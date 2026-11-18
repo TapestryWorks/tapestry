@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ids::ToolCallId;
+use crate::common::ToolCallId;
 
 /// Description of a tool exposed to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

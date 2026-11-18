@@ -5,23 +5,22 @@
 //! [OpenAI Codex `codex-protocol`](https://github.com/openai/codex).
 //!
 //! Every protocol type lives here, grouped by layer. Dependencies point one way:
-//! `ids` <- `common` <- `tool` <- `history` <- {`model`, `react`}, while `client`
-//! builds on `ids`, `common` and `tool` and never on `react`.
+//! `common` (ids, environment context, system reminders) <- `tool` <- `model`
+//! (including `HistoryItem`), while `event` and `submission` build only on
+//! `common` and `tool`.
 
-pub mod client;
+pub mod adapter;
 pub mod common;
 pub mod error;
-pub mod history;
-pub mod ids;
+pub mod event;
 pub mod model;
-pub mod react;
+pub mod submission;
 pub mod tool;
 
-pub use client::*;
+pub use adapter::*;
 pub use common::*;
 pub use error::ProtocolError;
-pub use history::*;
-pub use ids::*;
+pub use event::*;
 pub use model::*;
-pub use react::*;
+pub use submission::*;
 pub use tool::*;
