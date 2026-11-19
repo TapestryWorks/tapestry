@@ -1,7 +1,4 @@
-//! Renders structured history items into the text sent to the model.
-//!
-//! Every [`crate::ModelClient`] implementation shares these functions so the
-//! model sees one consistent format.
+//! Shared text rendering helpers used when preparing model messages.
 
 use tapestry_protocol::{EnvironmentContext, SystemReminder};
 

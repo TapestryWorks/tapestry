@@ -1,86 +1,67 @@
 use genai::chat::{
-    ChatMessage, ChatRequest, ChatResponse, ContentPart, MessageContent, Tool,
-    ToolCall as GenaiToolCall, ToolResponse, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, MessageContent, Tool, Usage,
 };
 
 use crate::error::CoreError;
-use crate::prompt::{render_environment_context, render_system_reminder, render_user};
+use crate::formatter::{Formatter, OpenAiFormatter};
 use tapestry_protocol::{
-    HistoryItem, ModelRequest, ModelResponse, TokenUsage, ToolCall, ToolCallId, ToolSpec,
+    ModelRequest, ModelResponse, ModelStreamItem, TokenUsage, ToolCall, ToolCallId,
 };
 
-/// Convert a Tapestry [`ModelRequest`] into a genai [`ChatRequest`].
+/// Convert a normalized request with the default [`OpenAiFormatter`].
 ///
-/// User names are rendered as a `"name: "` text prefix. Environment context and
-/// system reminders become unnamed user messages. Tool call ids are sent back
-/// exactly as the provider issued them.
+/// Model clients with an injected formatter use the corresponding internal
+/// conversion path instead.
 pub fn model_request_to_chat_request(request: &ModelRequest) -> ChatRequest {
-    let messages: Vec<ChatMessage> = request
-        .history
-        .iter()
-        .map(history_item_to_message)
-        .collect();
+    model_request_to_chat_request_with_formatter(request, &OpenAiFormatter)
+}
 
+/// Convert a request using the formatter selected by the model client.
+pub(crate) fn model_request_to_chat_request_with_formatter(
+    request: &ModelRequest,
+    formatter: &dyn Formatter,
+) -> ChatRequest {
+    let messages = formatter.format(&request.events);
     let mut chat_req = ChatRequest::new(messages);
     if let Some(system) = &request.system_prompt {
         chat_req = chat_req.with_system(system.clone());
     }
     if !request.tools.is_empty() {
-        chat_req = chat_req.with_tools(request.tools.iter().map(tool_spec_to_tool));
+        chat_req = chat_req.with_tools(request.tools.iter().map(|spec| {
+            Tool::new(spec.name.clone())
+                .with_description(spec.description.clone())
+                .with_schema(spec.parameters.clone())
+        }));
     }
     chat_req
 }
 
-fn history_item_to_message(item: &HistoryItem) -> ChatMessage {
-    match item {
-        HistoryItem::User { name, content } => {
-            ChatMessage::user(render_user(name.as_deref(), content))
-        }
-        HistoryItem::EnvironmentContext(context) => {
-            ChatMessage::user(render_environment_context(context))
-        }
-        HistoryItem::SystemReminder(reminder) => {
-            ChatMessage::user(render_system_reminder(reminder))
-        }
-        HistoryItem::Assistant {
-            content,
-            tool_calls,
-        } => {
-            if tool_calls.is_empty() {
-                return ChatMessage::assistant(content.clone().unwrap_or_default());
-            }
-            let mut parts = Vec::new();
-            if let Some(text) = content.as_ref().filter(|t| !t.is_empty()) {
-                parts.push(ContentPart::Text(text.clone()));
-            }
-            parts.extend(tool_calls.iter().map(|call| {
-                ContentPart::ToolCall(GenaiToolCall {
-                    call_id: call.id.as_str().to_string(),
-                    fn_name: call.name.clone(),
-                    fn_arguments: call.arguments.clone(),
-                    thought_signatures: None,
-                })
-            }));
-            ChatMessage::assistant(MessageContent::from_parts(parts))
-        }
-        HistoryItem::ToolResult(result) => ChatMessage::from(
-            ToolResponse::new(result.call_id.as_str().to_string(), result.output.clone())
-                .with_fn_name(result.tool_name.clone()),
-        ),
+/// Convert a genai [`ChatResponse`] into Tapestry's [`ModelResponse`].
+pub fn chat_response_to_model_response(response: ChatResponse) -> ModelResponse {
+    message_content_to_model_response(&response.content, &response.usage)
+}
+
+/// Map one genai stream event: text chunks become deltas, the end event (with
+/// captured content, tool calls and usage) becomes `Completed`; other events
+/// (start, reasoning, thought signatures, tool-call chunks) are dropped.
+pub fn chat_stream_event_to_item(event: ChatStreamEvent) -> Option<ModelStreamItem> {
+    match event {
+        ChatStreamEvent::Chunk(chunk) => Some(ModelStreamItem::TextDelta {
+            text: chunk.content,
+        }),
+        ChatStreamEvent::End(end) => Some(ModelStreamItem::Completed {
+            response: message_content_to_model_response(
+                &end.captured_content.unwrap_or_default(),
+                &end.captured_usage.unwrap_or_default(),
+            ),
+        }),
+        _ => None,
     }
 }
 
-/// Convert a [`ToolSpec`] into a genai [`Tool`].
-pub fn tool_spec_to_tool(spec: &ToolSpec) -> Tool {
-    Tool::new(spec.name.clone())
-        .with_description(spec.description.clone())
-        .with_schema(spec.parameters.clone())
-}
-
-/// Convert a genai [`ChatResponse`] into Tapestry's [`ModelResponse`].
-pub fn chat_response_to_model_response(response: ChatResponse) -> ModelResponse {
-    let content = response.first_text().map(str::to_string);
-    let tool_calls = response
+fn message_content_to_model_response(content: &MessageContent, usage: &Usage) -> ModelResponse {
+    let text = content.first_text().map(str::to_string);
+    let tool_calls = content
         .tool_calls()
         .into_iter()
         .map(|call| {
@@ -94,9 +75,9 @@ pub fn chat_response_to_model_response(response: ChatResponse) -> ModelResponse 
         .collect();
 
     ModelResponse {
-        content,
+        content: text,
         tool_calls,
-        usage: usage_to_token_usage(&response.usage),
+        usage: usage_to_token_usage(usage),
     }
 }
 
@@ -147,15 +128,68 @@ pub fn chat_text_and_tokens(response: &ChatResponse) -> (Option<String>, u32, u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formatter::prompt::render_environment_context;
     use crate::tool::Tool as _;
 
-    use genai::chat::PromptTokensDetails;
-    use tapestry_protocol::{EnvironmentContext, SystemReminder, ToolResult};
+    use crate::formatter::Formatter;
+    use genai::chat::{
+        ContentPart, PromptTokensDetails, StreamChunk, StreamEnd, ToolCall as GenaiToolCall,
+    };
+    use tapestry_protocol::{
+        AssistantMessageEvent, EnvironmentContext, EnvironmentContextUpdatedEvent, Event, EventMsg,
+        HistoryItem, MessageId, ModelRequest, SubmissionId, SystemReminder, SystemReminderEvent,
+        ThreadId, ToolCallEndEvent, ToolResult, ToolSpec, TurnId, UserMessageEvent,
+    };
 
-    fn request(history: Vec<HistoryItem>, tools: Vec<ToolSpec>) -> ModelRequest {
+    fn request(items: Vec<HistoryItem>, tools: Vec<ToolSpec>) -> ModelRequest {
+        let submission_id = SubmissionId::new();
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let events = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let msg = match item {
+                    HistoryItem::User { name, content } => {
+                        EventMsg::UserMessage(UserMessageEvent { name, content })
+                    }
+                    HistoryItem::Assistant {
+                        content,
+                        tool_calls,
+                    } => EventMsg::AssistantMessage(AssistantMessageEvent {
+                        message_id: MessageId::new(),
+                        content,
+                        tool_calls,
+                    }),
+                    HistoryItem::ToolResult(result) => EventMsg::ToolCallEnd(ToolCallEndEvent {
+                        result,
+                        duration_ms: None,
+                    }),
+                    HistoryItem::EnvironmentContext(context) => {
+                        EventMsg::EnvironmentContextUpdated(EnvironmentContextUpdatedEvent {
+                            context,
+                        })
+                    }
+                    HistoryItem::SystemReminder(reminder) => {
+                        EventMsg::SystemReminder(SystemReminderEvent {
+                            iteration: 0,
+                            reminder,
+                        })
+                    }
+                };
+                Event {
+                    id: submission_id,
+                    log_position: index as u64 + 1,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: index as u64,
+                    msg,
+                }
+            })
+            .collect();
         ModelRequest {
             system_prompt: Some("You are helpful.".into()),
-            history,
+            events,
             tools,
             iteration: 0,
         }
@@ -203,7 +237,7 @@ mod tests {
         );
         assert_eq!(
             chat_req.messages[1].content.first_text(),
-            Some(crate::prompt::FORCED_FINISH_REMINDER)
+            Some(crate::formatter::prompt::FORCED_FINISH_REMINDER)
         );
     }
 
@@ -255,6 +289,41 @@ mod tests {
         assert_eq!(tools[0].schema, Some(spec.parameters));
     }
 
+    #[test]
+    fn custom_formatter_builds_messages_with_prompt_and_optional_tools() {
+        struct CustomFormatter;
+
+        impl Formatter for CustomFormatter {
+            fn history_items_to_messages(&self, _items: &[HistoryItem]) -> Vec<ChatMessage> {
+                vec![ChatMessage::user("custom message")]
+            }
+        }
+
+        let empty = request(vec![HistoryItem::user(None, "original")], vec![]);
+        let mapped = model_request_to_chat_request_with_formatter(&empty, &CustomFormatter);
+        assert_eq!(mapped.system.as_deref(), Some("You are helpful."));
+        assert_eq!(mapped.messages.len(), 1);
+        assert_eq!(
+            mapped.messages[0].content.first_text(),
+            Some("custom message")
+        );
+        assert!(mapped.tools.is_none());
+
+        let spec = crate::tool::EchoTool.spec();
+        let with_tools = request(vec![], vec![spec.clone()]);
+        let mapped = model_request_to_chat_request_with_formatter(&with_tools, &CustomFormatter);
+        assert_eq!(
+            mapped.messages[0].content.first_text(),
+            Some("custom message")
+        );
+        let tools = mapped.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].name,
+            genai::chat::ToolName::Custom(spec.name.clone())
+        );
+    }
+
     fn response(calls: Vec<(&str, &str)>, usage: Usage) -> ChatResponse {
         let mut parts = vec![ContentPart::Text("hi".into())];
         parts.extend(calls.into_iter().map(|(id, name)| {
@@ -290,6 +359,62 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stream_chunk_maps_to_text_delta() {
+        let item = chat_stream_event_to_item(ChatStreamEvent::Chunk(StreamChunk {
+            content: "Hel".into(),
+        }));
+        assert_eq!(
+            item,
+            Some(ModelStreamItem::TextDelta { text: "Hel".into() })
+        );
+    }
+
+    #[test]
+    fn stream_end_maps_captured_content_to_completed() {
+        let end = StreamEnd {
+            captured_usage: Some(usage(7, 3, Some(2), None)),
+            captured_content: Some(response(vec![("c1", "echo")], Usage::default()).content),
+            ..Default::default()
+        };
+        let Some(ModelStreamItem::Completed { response: mapped }) =
+            chat_stream_event_to_item(ChatStreamEvent::End(end))
+        else {
+            panic!("expected completed");
+        };
+        assert_eq!(mapped.content.as_deref(), Some("hi"));
+        assert_eq!(mapped.tool_calls.len(), 1);
+        assert_eq!(mapped.tool_calls[0].id.as_str(), "c1");
+        assert_eq!(mapped.usage.input_tokens, 5);
+        assert_eq!(mapped.usage.cache_read_tokens, 2);
+    }
+
+    #[test]
+    fn stream_end_without_capture_is_an_empty_response() {
+        let item = chat_stream_event_to_item(ChatStreamEvent::End(StreamEnd::default()));
+        assert_eq!(
+            item,
+            Some(ModelStreamItem::Completed {
+                response: ModelResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn other_stream_events_are_dropped() {
+        assert_eq!(chat_stream_event_to_item(ChatStreamEvent::Start), None);
+        assert_eq!(
+            chat_stream_event_to_item(ChatStreamEvent::ReasoningChunk(StreamChunk {
+                content: "think".into()
+            })),
+            None
+        );
     }
 
     #[test]

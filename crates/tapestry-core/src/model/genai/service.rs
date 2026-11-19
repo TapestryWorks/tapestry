@@ -1,9 +1,9 @@
 use genai::chat::{ChatOptions, ChatRequest, ChatStreamResponse};
 use genai::Client;
 
+use super::config::{build_client, GenaiProviderConfig};
+use super::mapping::{chat_text_and_tokens, map_genai_error, simple_chat_request};
 use crate::error::CoreError;
-use crate::genai::config::{build_client, GenaiProviderConfig};
-use crate::genai::mapping::{chat_text_and_tokens, map_genai_error, simple_chat_request};
 
 /// Result of a non-streaming chat turn.
 #[derive(Debug, Clone, PartialEq, Eq)]

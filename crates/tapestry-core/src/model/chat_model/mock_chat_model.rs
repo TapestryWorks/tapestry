@@ -1,10 +1,15 @@
 use async_trait::async_trait;
+use tapestry_protocol::{
+    HistoryItem, ModelRequest, ModelResponse, ModelStreamItem, TokenUsage, ToolCall, ToolCallId,
+};
 
 use crate::error::CoreError;
-use crate::prompt::render_user;
-use tapestry_protocol::{
-    HistoryItem, ModelRequest, ModelResponse, TokenUsage, ToolCall, ToolCallId,
-};
+use crate::formatter::prompt::render_user;
+use crate::formatter::{Formatter, OpenAiFormatter};
+
+use crate::model::ModelStream;
+
+use super::ChatModel;
 
 fn usage(input_tokens: u64, output_tokens: u64) -> TokenUsage {
     TokenUsage {
@@ -12,11 +17,6 @@ fn usage(input_tokens: u64, output_tokens: u64) -> TokenUsage {
         output_tokens,
         ..Default::default()
     }
-}
-
-#[async_trait]
-pub trait ModelClient: Send + Sync {
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError>;
 }
 
 /// Deterministic mock model for tests and local development.
@@ -29,14 +29,14 @@ pub trait ModelClient: Send + Sync {
 /// Environment context and system reminder items are not user messages and
 /// are never echoed.
 #[derive(Debug, Default)]
-pub struct MockModelClient;
+pub struct MockChatModel;
 
 #[async_trait]
-impl ModelClient for MockModelClient {
+impl ChatModel for MockChatModel {
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+        let history = OpenAiFormatter.events_to_history_items(&request.events);
         let Some((idx, name, content)) =
-            request
-                .history
+            history
                 .iter()
                 .enumerate()
                 .rev()
@@ -53,7 +53,7 @@ impl ModelClient for MockModelClient {
         };
 
         let rendered = render_user(name, content);
-        let results: Vec<(&str, &str)> = request.history[idx + 1..]
+        let results: Vec<(&str, &str)> = history[idx + 1..]
             .iter()
             .filter_map(|item| match item {
                 HistoryItem::ToolResult(result) => {
@@ -95,6 +95,25 @@ impl ModelClient for MockModelClient {
             usage: usage(8, 4),
         })
     }
+
+    /// Streams the text of [`complete`](Self::complete) word by word (each
+    /// delta keeps its trailing whitespace), then the full response.
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, CoreError> {
+        let response = self.complete(request).await?;
+        let mut items: Vec<_> = response
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .split_inclusive(char::is_whitespace)
+            .map(|word| {
+                Ok(ModelStreamItem::TextDelta {
+                    text: word.to_string(),
+                })
+            })
+            .collect();
+        items.push(Ok(ModelStreamItem::Completed { response }));
+        Ok(ModelStream::from_items(items))
+    }
 }
 
 fn parse_tool_request(message: &str) -> Option<String> {
@@ -105,22 +124,108 @@ fn parse_tool_request(message: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use tapestry_protocol::{EnvironmentContext, SystemReminder, ToolResult};
+    use tapestry_protocol::{
+        AssistantMessageEvent, EnvironmentContext, EnvironmentContextUpdatedEvent, Event, EventMsg,
+        HistoryItem, MessageId, SubmissionId, SystemReminder, SystemReminderEvent, ThreadId,
+        ToolCallEndEvent, ToolResult, TurnId, UserMessageEvent,
+    };
 
     use super::*;
 
-    fn request(history: Vec<HistoryItem>, iteration: u32) -> ModelRequest {
+    fn request(items: Vec<HistoryItem>, iteration: u32) -> ModelRequest {
+        let submission_id = SubmissionId::new();
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let events = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let msg = match item {
+                    HistoryItem::User { name, content } => {
+                        EventMsg::UserMessage(UserMessageEvent { name, content })
+                    }
+                    HistoryItem::Assistant {
+                        content,
+                        tool_calls,
+                    } => EventMsg::AssistantMessage(AssistantMessageEvent {
+                        message_id: MessageId::new(),
+                        content,
+                        tool_calls,
+                    }),
+                    HistoryItem::ToolResult(result) => EventMsg::ToolCallEnd(ToolCallEndEvent {
+                        result,
+                        duration_ms: None,
+                    }),
+                    HistoryItem::EnvironmentContext(context) => {
+                        EventMsg::EnvironmentContextUpdated(EnvironmentContextUpdatedEvent {
+                            context,
+                        })
+                    }
+                    HistoryItem::SystemReminder(reminder) => {
+                        EventMsg::SystemReminder(SystemReminderEvent {
+                            iteration: 0,
+                            reminder,
+                        })
+                    }
+                };
+                Event {
+                    id: submission_id,
+                    log_position: index as u64 + 1,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: index as u64,
+                    msg,
+                }
+            })
+            .collect();
         ModelRequest {
             system_prompt: None,
-            history,
+            events,
             tools: vec![],
             iteration,
         }
     }
 
+    async fn drain(mut stream: ModelStream) -> Vec<Result<ModelStreamItem, CoreError>> {
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    }
+
+    #[tokio::test]
+    async fn mock_stream_deltas_concatenate_to_complete_text() {
+        let req = request(vec![HistoryItem::user(None, "hello  big world")], 0);
+        let expected = MockChatModel.complete(req.clone()).await.unwrap();
+        let items = drain(MockChatModel.stream(req).await.unwrap()).await;
+        let (last, deltas) = items.split_last().unwrap();
+        assert!(deltas.len() > 1);
+        let text: String = deltas
+            .iter()
+            .map(|item| match item {
+                Ok(ModelStreamItem::TextDelta { text }) => text.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(Some(text), expected.content.clone());
+        assert_eq!(
+            last.as_ref().unwrap(),
+            &ModelStreamItem::Completed { response: expected }
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_stream_without_text_has_no_deltas() {
+        let req = request(vec![HistoryItem::user(None, "tool:echo")], 0);
+        let items = drain(MockChatModel.stream(req).await.unwrap()).await;
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Ok(ModelStreamItem::Completed { .. })));
+    }
+
     #[tokio::test]
     async fn mock_echoes_plain_message() {
-        let response = MockModelClient
+        let response = MockChatModel
             .complete(request(vec![HistoryItem::user(None, "hello")], 0))
             .await
             .unwrap();
@@ -131,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_uses_name_prefix_for_named_user() {
-        let response = MockModelClient
+        let response = MockChatModel
             .complete(request(
                 vec![HistoryItem::user(Some("alice".into()), "hi")],
                 0,
@@ -145,7 +250,7 @@ mod tests {
     async fn mock_requests_tool_then_summarizes() {
         let user = HistoryItem::user(None, "please tool:echo now");
 
-        let first = MockModelClient
+        let first = MockChatModel
             .complete(request(vec![user.clone()], 0))
             .await
             .unwrap();
@@ -153,7 +258,7 @@ mod tests {
         assert_eq!(first.tool_calls[0].name, "echo");
 
         let call = first.tool_calls[0].clone();
-        let second = MockModelClient
+        let second = MockChatModel
             .complete(request(
                 vec![
                     user,
@@ -171,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn mock_ignores_tool_results_of_earlier_turns() {
         let call = ToolCall::new(ToolCallId::generate(), "echo", serde_json::Value::Null);
-        let response = MockModelClient
+        let response = MockChatModel
             .complete(request(
                 vec![
                     HistoryItem::user(None, "tool:echo"),
@@ -189,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_does_not_echo_structured_items() {
-        let response = MockModelClient
+        let response = MockChatModel
             .complete(request(
                 vec![
                     HistoryItem::user(None, "question"),
