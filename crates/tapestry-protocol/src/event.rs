@@ -13,7 +13,7 @@ pub struct Event {
     /// Submission id this event correlates with.
     pub id: SubmissionId,
     /// Position in the thread's log, starting at 1 and assigned by the store.
-    pub seq: u64,
+    pub log_position: u64,
     pub thread_id: ThreadId,
     /// Turn this event belongs to; absent for events outside any turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +79,7 @@ pub struct EnvironmentContextUpdatedEvent {
     pub context: EnvironmentContext,
 }
 
-/// A transient reminder attached to one model request; not part of history.
+/// A reminder recorded before a model request and retained in projected history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemReminderEvent {
     pub iteration: u32,
@@ -188,7 +188,7 @@ mod tests {
     fn envelope(turn_id: Option<TurnId>, msg: EventMsg) -> Event {
         Event {
             id: SubmissionId::new(),
-            seq: 7,
+            log_position: 7,
             thread_id: ThreadId::new(),
             turn_id,
             timestamp_ms: 1_700_000_000_000,
@@ -220,11 +220,19 @@ mod tests {
             }),
         );
         let value = serde_json::to_value(&event).unwrap();
-        for key in ["id", "seq", "thread_id", "turn_id", "timestamp_ms", "msg"] {
+        for key in [
+            "id",
+            "log_position",
+            "thread_id",
+            "turn_id",
+            "timestamp_ms",
+            "msg",
+        ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
+        assert!(value.get("seq").is_none());
         assert_eq!(value["turn_id"], json!(turn_id.to_string()));
-        assert_eq!(value["seq"], 7);
+        assert_eq!(value["log_position"], 7);
         assert!(value["msg"].get("turn_id").is_none());
         assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
     }

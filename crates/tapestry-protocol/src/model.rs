@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::{EnvironmentContext, SystemReminder, TokenUsage};
+use crate::event::Event;
 use crate::tool::{ToolCall, ToolResult, ToolSpec};
 
 /// One entry of the conversation.
@@ -24,7 +25,7 @@ pub enum HistoryItem {
     },
     ToolResult(ToolResult),
     EnvironmentContext(EnvironmentContext),
-    /// Only present in request copies of history, never in the stored history.
+    /// Projected from a recorded reminder event and filtered when preparing model messages.
     SystemReminder(SystemReminder),
 }
 
@@ -60,11 +61,25 @@ impl From<EnvironmentContext> for HistoryItem {
     }
 }
 
-/// Conversation state passed to the model client.
+/// Conversation events passed to the model client in log order.
+///
+/// ```no_run
+/// use tapestry_protocol::{Event, ModelRequest};
+///
+/// fn request(events: Vec<Event>) -> ModelRequest {
+///     ModelRequest {
+///         system_prompt: None,
+///         events,
+///         tools: Vec::new(),
+///         iteration: 0,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub system_prompt: Option<String>,
-    pub history: Vec<HistoryItem>,
+    /// Ordered, immutable snapshot of the thread log at the start of this call.
+    pub events: Vec<Event>,
     /// Empty when tools are not allowed for this call.
     pub tools: Vec<ToolSpec>,
     pub iteration: u32,
@@ -89,6 +104,9 @@ pub enum ModelStreamItem {
 
 #[cfg(test)]
 mod tests {
+    use crate::event::{
+        AssistantMessageEvent, EventMsg, SystemReminderEvent, ToolCallEndEvent, UserMessageEvent,
+    };
     use serde_json::json;
 
     use super::*;
@@ -220,19 +238,95 @@ mod tests {
 
     #[test]
     fn request_and_response_round_trip() {
+        let submission_id = crate::SubmissionId::new();
+        let thread_id = crate::ThreadId::new();
+        let turn_id = crate::TurnId::new();
+        let message_id = crate::MessageId::new();
+        let call = ToolCall::new(
+            crate::ToolCallId::from("provider/call-7"),
+            "echo",
+            json!({"input": "hello"}),
+        );
         let request = ModelRequest {
             system_prompt: Some("sys".into()),
-            history: vec![
-                HistoryItem::user(None, "hi"),
-                HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
+            events: vec![
+                Event {
+                    id: submission_id,
+                    log_position: 1,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: 100,
+                    msg: EventMsg::UserMessage(UserMessageEvent {
+                        name: Some("alice".into()),
+                        content: "hi".into(),
+                    }),
+                },
+                Event {
+                    id: submission_id,
+                    log_position: 2,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: 101,
+                    msg: EventMsg::AssistantMessage(AssistantMessageEvent {
+                        message_id,
+                        content: Some("calling".into()),
+                        tool_calls: vec![call.clone()],
+                    }),
+                },
+                Event {
+                    id: submission_id,
+                    log_position: 3,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: 102,
+                    msg: EventMsg::ToolCallEnd(ToolCallEndEvent {
+                        result: ToolResult::completed(&call, "hello"),
+                        duration_ms: Some(5),
+                    }),
+                },
+                Event {
+                    id: submission_id,
+                    log_position: 4,
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    timestamp_ms: 103,
+                    msg: EventMsg::SystemReminder(SystemReminderEvent {
+                        iteration: 2,
+                        reminder: SystemReminder::ToolLimitReached,
+                    }),
+                },
             ],
             tools: vec![],
             iteration: 2,
         };
-        let json = serde_json::to_string(&request).unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("events").is_some());
+        assert!(value.get("history").is_none());
+        assert_eq!(value["events"].as_array().unwrap().len(), 4);
+        assert_eq!(value["events"][0]["msg"]["type"], "user_message");
+        assert_eq!(value["events"][1]["msg"]["type"], "assistant_message");
+        assert_eq!(value["events"][2]["msg"]["type"], "tool_call_end");
+        assert_eq!(value["events"][3]["msg"]["type"], "system_reminder");
         assert_eq!(
-            serde_json::from_str::<ModelRequest>(&json).unwrap(),
-            request
+            value["events"][1]["msg"]["tool_calls"][0]["id"],
+            "provider/call-7"
+        );
+        assert_eq!(
+            value["events"][2]["msg"]["result"]["call_id"],
+            "provider/call-7"
+        );
+        assert_eq!(value["events"][0]["id"], submission_id.to_string());
+        assert_eq!(value["events"][0]["thread_id"], thread_id.to_string());
+        assert_eq!(value["events"][0]["turn_id"], turn_id.to_string());
+        assert_eq!(
+            value["events"][1]["msg"]["message_id"],
+            message_id.to_string()
+        );
+        assert_eq!(value["events"][2]["log_position"], 3);
+        assert_eq!(value["events"][2]["timestamp_ms"], 102);
+        assert_eq!(
+            serde_json::from_value::<ModelRequest>(value).unwrap(),
+            request,
         );
 
         let response = ModelResponse {

@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/tapestry-protocol", "crates/tapestry-core"]
+members = [
+    "crates/tapestry-protocol",
+    "crates/tapestry-core",
+    "crates/tapestry-adapter-agui",
+    "crates/tapestry-adapter-a2a",
+]
 resolver = "2"
 
 [workspace.package]
@@ -22,3 +27,4 @@ iana-time-zone = "0.1"
 
 tapestry-protocol = { path = "crates/tapestry-protocol" }
 genai = "0.6"
+futures-util = { version = "0.3", default-features = false }

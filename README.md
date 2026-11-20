@@ -10,26 +10,28 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 
 | Crate | Description |
 |-------|-------------|
-| [`tapestry-protocol`](crates/tapestry-protocol) | SQ/EQ protocol types (`Submission`, `Op`, `Event`, `EventMsg`) |
+| [`tapestry-protocol`](crates/tapestry-protocol) | SQ/EQ protocol types (`Submission`, `Command`, `Event`, `EventMsg`) |
 | [`tapestry-core`](crates/tapestry-core) | Thread lifecycle, agent loop, model + tool interfaces |
+| [`tapestry-adapter-agui`](crates/tapestry-adapter-agui) | Tapestry event stream to AG-UI 1.0 events |
+| [`tapestry-adapter-a2a`](crates/tapestry-adapter-a2a) | Tapestry event stream to A2A 1.0 streaming responses |
 
 ## Quick start
 
 ```bash
 cargo test --workspace
-cargo test -p tapestry-core --features genai
+cargo test -p tapestry-core
 ```
 
 ### Multi-provider models (genai)
 
-The `genai` feature on `tapestry-core` adds a unified adapter for OpenAI, Anthropic,
-Gemini, xAI, Groq, DeepSeek, Ollama, and other providers supported by
+`tapestry-core` includes a unified genai adapter for OpenAI, Anthropic, Gemini,
+xAI, Groq, DeepSeek, Ollama, and other providers supported by
 [`genai`](https://crates.io/crates/genai) 0.6.
 
-Build with the feature:
+Build:
 
 ```bash
-cargo build -p tapestry-core --features genai
+cargo build -p tapestry-core
 ```
 
 **Model naming** — either form works:
@@ -56,10 +58,46 @@ let turn = service.chat_simple(Some("You are helpful."), "Hello!").await?;
 let model = GenaiModelClient::from_model("ollama::llama3.2")?;
 ```
 
+For explicit OpenAI endpoints, use `OpenAiChatModel::from_model("gpt-4o-mini")`
+for Chat Completions, or `OpenAiResponseModel::from_model("gpt-5-mini")` for the
+Responses API. Both support streaming and use `OPENAI_API_KEY` by default.
+`OpenAiResponseModel` sends a local event snapshot on every call rather than
+chaining server-side response IDs. `ModelRequest.events` is the ordered log
+snapshot; model clients turn it into provider messages with their formatter.
+
+Formatter behavior can be selected when creating either OpenAI model:
+
+```rust
+use std::sync::Arc;
+use tapestry_core::{CoreError, OpenAiChatModel, OpenAiFormatter};
+
+fn build_model() -> Result<OpenAiChatModel, CoreError> {
+    Ok(OpenAiChatModel::from_model("gpt-4o-mini")?
+        .with_formatter(Arc::new(OpenAiFormatter)))
+}
+```
+
+Direct model clients also construct `ModelRequest` with `events: Vec<Event>`
+rather than a pre-projected `history`; each request owns a stable copy of the
+thread log up to the call:
+
+```rust
+use tapestry_protocol::{Event, ModelRequest};
+
+fn make_request(events: Vec<Event>) -> ModelRequest {
+    ModelRequest {
+        system_prompt: None,
+        events,
+        tools: Vec::new(),
+        iteration: 0,
+    }
+}
+```
+
 Run the multi-provider example (skips providers whose env vars are missing):
 
 ```bash
-cargo run -p tapestry-core --features genai --example genai_multi_provider
+cargo run -p tapestry-core --example genai_multi_provider
 ```
 
 Minimal programmatic usage:
@@ -67,7 +105,7 @@ Minimal programmatic usage:
 ```rust
 use std::sync::Arc;
 use tapestry_core::{EchoTool, MockModelClient, TapestryThread, ToolRegistry};
-use tapestry_protocol::{EventMsg, Op};
+use tapestry_protocol::{Command, EventMsg, ThreadSettings};
 
 #[tokio::main]
 async fn main() {
@@ -80,29 +118,70 @@ async fn main() {
     );
 
     let config_id = handle
-        .submit(Op::Configure {
-            model: "mock-model".into(),
-            system_prompt: None,
+        .submit(Command::UpdateSettings {
+            settings: ThreadSettings {
+                model: Some("mock-model".into()),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
-    handle.collect_events_for(config_id).await;
+    // Read the thread's event log from the beginning.
+    let mut events = handle.subscribe(0).await.unwrap();
+    events.collect_events_for(config_id).await.unwrap();
 
     let turn_id = handle
-        .submit(Op::StartTurn {
-            user_message: "hello".into(),
+        .submit(Command::StartTurn {
+            content: "hello".into(),
+            name: None,
             turn_id: None,
         })
         .await
         .unwrap();
 
-    for event in handle.collect_events_for(turn_id).await {
-        if let EventMsg::AgentMessage(msg) = event.msg {
-            println!("{}", msg.content);
+    for event in events.collect_events_for(turn_id).await.unwrap() {
+        if let EventMsg::AssistantMessage(msg) = event.msg {
+            println!("{}", msg.content.unwrap_or_default());
         }
     }
 }
 ```
+
+### Protocol adapters
+
+The adapter crates consume ordered events from `EventSubscription` and convert each
+event into zero or more protocol outputs. Call `finish()` when the subscription
+ends so an adapter can close incomplete messages or tasks. `EventFilter` lets
+consumers opt into categories emitted as AG-UI `CUSTOM`; the A2A adapter ignores
+events without a task-level mapping.
+
+```rust
+use std::error::Error;
+
+use tapestry_adapter_agui::AguiAdapter;
+use tapestry_core::ThreadHandle;
+use tapestry_protocol::{EventAdapter, EventFilter, SubmissionId};
+
+async fn consume(
+    thread_handle: &ThreadHandle,
+    turn_id: SubmissionId,
+) -> Result<(), Box<dyn Error>> {
+    let mut adapter = AguiAdapter::new(EventFilter::none());
+    let mut events = thread_handle.subscribe(0).await?;
+    for event in events.collect_events_for(turn_id).await? {
+        for output in adapter.adapt(&event) {
+            println!("{}", serde_json::to_string(&output)?);
+        }
+    }
+    for output in adapter.finish() {
+        println!("{}", serde_json::to_string(&output)?);
+    }
+    Ok(())
+}
+```
+
+When adding an `EventMsg` variant, assign its `EventCategory` and update each
+protocol adapter's mapping and tests.
 
 ## Development
 

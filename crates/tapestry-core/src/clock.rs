@@ -1,6 +1,8 @@
 //! Injectable wall clock used to give the model the current date and time zone.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, FixedOffset, Local};
 
@@ -17,9 +19,11 @@ pub struct ClockReading {
 #[error("clock unavailable: {0}")]
 pub struct ClockError(pub String);
 
-/// Source of the current local date and time zone.
+/// Source of the current local date, time zone, and event timestamps.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Result<ClockReading, ClockError>;
+    /// Milliseconds since the Unix epoch, used to timestamp events.
+    fn unix_millis(&self) -> u64;
 }
 
 /// Reads the operating system clock and time zone.
@@ -47,12 +51,20 @@ impl Clock for SystemClock {
         let now = Local::now().fixed_offset();
         Ok(Self::reading_from(now, iana_time_zone::get_timezone()))
     }
+
+    fn unix_millis(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default()
+    }
 }
 
 /// Programmable clock for tests.
 #[derive(Debug)]
 pub struct FixedClock {
     state: Mutex<Result<ClockReading, ClockError>>,
+    millis: AtomicU64,
 }
 
 impl FixedClock {
@@ -62,7 +74,13 @@ impl FixedClock {
                 local_date: local_date.into(),
                 timezone: timezone.into(),
             })),
+            millis: AtomicU64::new(0),
         }
+    }
+
+    /// Set the value returned by [`Clock::unix_millis`] (defaults to 0).
+    pub fn set_unix_millis(&self, millis: u64) {
+        self.millis.store(millis, Ordering::SeqCst);
     }
 
     pub fn set(&self, local_date: impl Into<String>, timezone: impl Into<String>) {
@@ -80,6 +98,10 @@ impl FixedClock {
 impl Clock for FixedClock {
     fn now(&self) -> Result<ClockReading, ClockError> {
         self.state.lock().unwrap().clone()
+    }
+
+    fn unix_millis(&self) -> u64 {
+        self.millis.load(Ordering::SeqCst)
     }
 }
 
@@ -113,6 +135,16 @@ mod tests {
         let r = SystemClock.now().unwrap();
         assert_eq!(r.local_date.len(), 10);
         assert!(!r.timezone.is_empty());
+        // After 2020-01-01.
+        assert!(SystemClock.unix_millis() > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn fixed_clock_returns_configured_millis() {
+        let clock = FixedClock::new("2026-11-04", "UTC");
+        assert_eq!(clock.unix_millis(), 0);
+        clock.set_unix_millis(1_700_000_000_123);
+        assert_eq!(clock.unix_millis(), 1_700_000_000_123);
     }
 
     #[test]

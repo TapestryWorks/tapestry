@@ -2,7 +2,7 @@
 //!
 //! Run (requires API keys in the environment for cloud models):
 //! ```bash
-//! cargo run -p tapestry-core --features genai --example genai_multi_provider
+//! cargo run -p tapestry-core --example genai_multi_provider
 //! ```
 //!
 //! Environment variables:

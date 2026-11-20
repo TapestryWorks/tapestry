@@ -1,0 +1,17 @@
+[package]
+name = "tapestry-adapter-agui"
+description = "AG-UI 1.0 event adapter for Tapestry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tapestry-protocol = { workspace = true }
+
+[dev-dependencies]
+tapestry-core = { path = "../tapestry-core" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -120,7 +120,7 @@ mod tests {
     fn event(msg: EventMsg) -> Event {
         Event {
             id: SubmissionId::new(),
-            seq: 1,
+            log_position: 1,
             thread_id: ThreadId::new(),
             turn_id: Some(TurnId::new()),
             timestamp_ms: 123,

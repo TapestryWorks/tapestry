@@ -16,6 +16,8 @@ pub enum CoreError {
     Protocol(#[from] ProtocolError),
     #[error("channel closed")]
     ChannelClosed,
+    #[error("event store error: {0}")]
+    EventStore(String),
     #[error("tool error: {0}")]
     Tool(String),
     #[error("internal state error: {0}")]

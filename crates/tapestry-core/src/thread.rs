@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use tapestry_protocol::{
-    ErrorEvent, Event, EventMsg, Op, SessionConfiguredEvent, Submission, SubmissionId, ThreadId,
+    Command, ErrorEvent, EventMsg, SessionConfiguredEvent, Submission, SubmissionId, ThreadId,
     TurnAbortReason, TurnAbortedEvent, TurnId,
 };
 
@@ -12,29 +12,21 @@ use crate::agent::AgentLoop;
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
+use crate::formatter::formatter_trait::HistoryProjection;
 use crate::model::ModelClient;
+use crate::recorder::Recorder;
+use crate::store::{EventStore, EventSubscription, InMemoryEventStore};
 use crate::tool::ToolRegistry;
-use tapestry_protocol::HistoryItem;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 
-/// Per-thread session state owned by the worker task.
+/// Per-thread session state owned by the worker task. History is not kept
+/// here: it is the projection of the event log, owned by the [`Recorder`].
 #[derive(Default)]
 struct Session {
     config: ThreadConfig,
     configured: bool,
     active_turn: Option<TurnId>,
-    /// Kept across turns; in-memory only and unbounded.
-    history: Vec<HistoryItem>,
-}
-
-impl Session {
-    /// The only way to rewrite history wholesale (compaction, rollback, restore).
-    /// The time-context baseline is derived from history, so nothing else resets.
-    #[allow(dead_code)]
-    fn replace_history(&mut self, history: Vec<HistoryItem>) {
-        self.history = history;
-    }
 }
 
 fn validate_user_name(name: &str) -> Result<(), CoreError> {
@@ -49,16 +41,21 @@ fn validate_user_name(name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Handle for submitting operations and receiving events from a thread.
+/// Handle for submitting commands to a thread and subscribing to its events.
 #[derive(Clone)]
 pub struct ThreadHandle {
+    thread_id: ThreadId,
     submission_tx: mpsc::Sender<Submission>,
-    event_rx: Arc<Mutex<mpsc::Receiver<Event>>>,
+    store: Arc<dyn EventStore>,
 }
 
 impl ThreadHandle {
-    pub async fn submit(&self, op: Op) -> Result<SubmissionId, CoreError> {
-        let submission = Submission::new(op);
+    pub fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub async fn submit(&self, command: Command) -> Result<SubmissionId, CoreError> {
+        let submission = Submission::new(command);
         let id = submission.id;
         self.submission_tx
             .send(submission)
@@ -67,39 +64,95 @@ impl ThreadHandle {
         Ok(id)
     }
 
-    pub async fn next_event(&self) -> Option<Event> {
-        self.event_rx.lock().await.recv().await
-    }
-
-    pub async fn collect_events_for(&self, submission_id: SubmissionId) -> Vec<Event> {
-        let mut events = Vec::new();
-        while let Some(event) = self.next_event().await {
-            let done = matches!(
-                event.msg,
-                EventMsg::TurnComplete(_)
-                    | EventMsg::TurnAborted(_)
-                    | EventMsg::Error(_)
-                    | EventMsg::SessionConfigured(_)
-            );
-            let same = event.id == submission_id;
-            events.push(event);
-            if same && done {
-                break;
-            }
-        }
-        events
+    /// Follow the thread's event log from just after `after_log_position` (0 = from the
+    /// start). Every subscription has its own cursor and sees every event.
+    pub async fn subscribe(&self, after_log_position: u64) -> Result<EventSubscription, CoreError> {
+        self.store
+            .subscribe(self.thread_id, after_log_position)
+            .await
     }
 }
 
-/// A long-lived agent thread with SQ/EQ channels.
+/// Configures and starts a [`TapestryThread`].
+pub struct ThreadBuilder {
+    model: Arc<dyn ModelClient>,
+    tools: Arc<ToolRegistry>,
+    clock: Arc<dyn Clock>,
+    store: Arc<dyn EventStore>,
+}
+
+impl ThreadBuilder {
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Where the thread's events are stored; defaults to [`InMemoryEventStore`].
+    pub fn event_store(mut self, store: Arc<dyn EventStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Start a new thread. Must be called within a Tokio runtime.
+    pub fn spawn(self) -> (TapestryThread, ThreadHandle) {
+        self.start(ThreadId::new(), HistoryProjection::new())
+    }
+
+    /// Continue an existing thread from its event log: history is folded from
+    /// the log and new events continue their log positions. Settings are not
+    /// stored in the log, so the resumed thread is unconfigured until
+    /// `UpdateSettings`.
+    pub async fn resume(
+        self,
+        thread_id: ThreadId,
+    ) -> Result<(TapestryThread, ThreadHandle), CoreError> {
+        let events = self.store.read_after(thread_id, 0).await?;
+        let projection = HistoryProjection::fold(&events);
+        Ok(self.start(thread_id, projection))
+    }
+
+    fn start(
+        self,
+        thread_id: ThreadId,
+        projection: HistoryProjection,
+    ) -> (TapestryThread, ThreadHandle) {
+        let (submission_tx, submission_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        let handle = ThreadHandle {
+            thread_id,
+            submission_tx,
+            store: self.store.clone(),
+        };
+        let recorder =
+            Recorder::with_projection(self.store, self.clock.clone(), thread_id, projection);
+        let agent = AgentLoop::with_clock(self.model, self.tools, self.clock);
+        tokio::spawn(run_thread_loop(submission_rx, recorder, agent));
+
+        let thread = TapestryThread {
+            thread_id,
+            handle: handle.clone(),
+        };
+        (thread, handle)
+    }
+}
+
+/// A long-lived agent thread: a submission queue in, an event log out.
 pub struct TapestryThread {
     thread_id: ThreadId,
     handle: ThreadHandle,
 }
 
 impl TapestryThread {
+    pub fn builder(model: Arc<dyn ModelClient>, tools: Arc<ToolRegistry>) -> ThreadBuilder {
+        ThreadBuilder {
+            model,
+            tools,
+            clock: Arc::new(SystemClock),
+            store: Arc::new(InMemoryEventStore::new()),
+        }
+    }
+
     pub fn spawn(model: Arc<dyn ModelClient>, tools: Arc<ToolRegistry>) -> (Self, ThreadHandle) {
-        Self::spawn_with_clock(model, tools, Arc::new(SystemClock))
+        Self::builder(model, tools).spawn()
     }
 
     pub fn spawn_with_clock(
@@ -107,30 +160,7 @@ impl TapestryThread {
         tools: Arc<ToolRegistry>,
         clock: Arc<dyn Clock>,
     ) -> (Self, ThreadHandle) {
-        let thread_id = ThreadId::new();
-        let (submission_tx, submission_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
-        let (event_tx, event_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
-
-        let handle = ThreadHandle {
-            submission_tx,
-            event_rx: Arc::new(Mutex::new(event_rx)),
-        };
-
-        let worker_handle = handle.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                run_thread_loop(thread_id, submission_rx, event_tx, model, tools, clock).await
-            {
-                warn!(?err, "thread loop exited with error");
-            }
-        });
-
-        let thread = Self {
-            thread_id,
-            handle: worker_handle.clone(),
-        };
-
-        (thread, handle)
+        Self::builder(model, tools).clock(clock).spawn()
     }
 
     pub fn thread_id(&self) -> ThreadId {
@@ -143,92 +173,66 @@ impl TapestryThread {
 }
 
 async fn run_thread_loop(
-    thread_id: ThreadId,
     mut submission_rx: mpsc::Receiver<Submission>,
-    event_tx: mpsc::Sender<Event>,
-    model: Arc<dyn ModelClient>,
-    tools: Arc<ToolRegistry>,
-    clock: Arc<dyn Clock>,
-) -> Result<(), CoreError> {
+    mut recorder: Recorder,
+    agent: AgentLoop,
+) {
     let mut session = Session::default();
-    let agent = AgentLoop::with_clock(model, tools, clock);
 
     while let Some(submission) = submission_rx.recv().await {
         debug!(submission_id = %submission.id, "processing submission");
+        recorder.begin_submission(submission.id);
 
-        let submission_id = submission.id;
         let result =
-            process_submission(&agent, thread_id, &mut session, submission, &event_tx).await;
+            process_submission(&agent, &mut session, &mut recorder, submission.command).await;
 
-        if let Err(err) = result {
-            let _ = event_tx
-                .send(Event::new(
-                    submission_id,
-                    EventMsg::Error(ErrorEvent {
-                        message: err.to_string(),
-                    }),
-                ))
-                .await;
+        match result {
+            Ok(()) => {}
+            // Record an error with the turn id of the failed submission when
+            // the store still accepts writes; otherwise keep the append error.
+            Err(err) => {
+                let message = err.to_string();
+                if let Err(err) = recorder
+                    .record(EventMsg::Error(ErrorEvent { message }))
+                    .await
+                {
+                    warn!(?err, submission_id = %submission.id, "failed to record error");
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn process_submission(
     agent: &AgentLoop,
-    thread_id: ThreadId,
     session: &mut Session,
-    submission: Submission,
-    event_tx: &mpsc::Sender<Event>,
+    recorder: &mut Recorder,
+    command: Command,
 ) -> Result<(), CoreError> {
-    match submission.op {
-        Op::Configure {
-            model,
-            system_prompt,
-        } => {
-            session.config.model = model.clone();
-            session.config.system_prompt = system_prompt;
-            session.configured = true;
-            event_tx
-                .send(Event::new(
-                    submission.id,
-                    EventMsg::SessionConfigured(SessionConfiguredEvent { thread_id, model }),
-                ))
-                .await
-                .map_err(|_| CoreError::ChannelClosed)?;
-        }
-        Op::ThreadSettings { settings } => {
+    match command {
+        Command::UpdateSettings { settings } => {
             session.config.apply_settings(&settings);
             if !session.configured {
                 session.configured = true;
-                event_tx
-                    .send(Event::new(
-                        submission.id,
-                        EventMsg::SessionConfigured(SessionConfiguredEvent {
-                            thread_id,
-                            model: session.config.model.clone(),
-                        }),
-                    ))
-                    .await
-                    .map_err(|_| CoreError::ChannelClosed)?;
+                let thread_id = recorder.thread_id();
+                recorder
+                    .record(EventMsg::SessionConfigured(SessionConfiguredEvent {
+                        thread_id,
+                        model: session.config.model.clone(),
+                    }))
+                    .await?;
             }
         }
-        Op::Interrupt => {
-            let aborted = session.active_turn.take();
-            event_tx
-                .send(Event::new(
-                    submission.id,
-                    EventMsg::TurnAborted(TurnAbortedEvent {
-                        turn_id: aborted,
-                        reason: TurnAbortReason::Interrupted,
-                        message: Some("interrupted by client".into()),
-                    }),
-                ))
-                .await
-                .map_err(|_| CoreError::ChannelClosed)?;
+        Command::Interrupt => {
+            recorder.set_turn(session.active_turn.take());
+            recorder
+                .record(EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                    message: Some("interrupted by client".into()),
+                }))
+                .await?;
         }
-        Op::StartTurn {
+        Command::StartTurn {
             content,
             name,
             turn_id,
@@ -245,19 +249,9 @@ async fn process_submission(
 
             let turn_id = turn_id.unwrap_or_else(TurnId::new);
             session.active_turn = Some(turn_id);
-
             let run_result = agent
-                .run_turn(
-                    submission.id,
-                    turn_id,
-                    content,
-                    name,
-                    &mut session.history,
-                    &session.config,
-                    event_tx,
-                )
+                .run_turn(recorder, turn_id, content, name, &session.config)
                 .await;
-
             session.active_turn.take();
             run_result?;
         }
@@ -268,13 +262,25 @@ async fn process_submission(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use tapestry_protocol::EventMsg;
+    use tapestry_protocol::{
+        Event, EventMsg, HistoryItem, ModelRequest, ModelResponse, ThreadSettings,
+    };
 
     use super::*;
+    use crate::clock::FixedClock;
+    use crate::formatter::prompt::render_system_reminder;
+    use crate::formatter::{Formatter, OpenAiFormatter};
     use crate::model::MockModelClient;
+    use crate::store::testing::FlakyStore;
+    use crate::store::NewEvent;
     use crate::tool::{EchoTool, ToolRegistry};
+
+    fn request_history(request: &ModelRequest) -> Vec<HistoryItem> {
+        OpenAiFormatter.events_to_history_items(&request.events)
+    }
 
     fn test_tools() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
@@ -282,102 +288,75 @@ mod tests {
         Arc::new(registry)
     }
 
-    #[tokio::test]
-    async fn thread_configure_and_turn() {
-        let (_thread, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
-
-        let config_id = handle
-            .submit(Op::Configure {
-                model: "mock-model".into(),
-                system_prompt: Some("test".into()),
-            })
-            .await
-            .unwrap();
-
-        let config_events = handle.collect_events_for(config_id).await;
-        assert!(matches!(
-            config_events.last().map(|e| &e.msg),
-            Some(EventMsg::SessionConfigured(_))
-        ));
-
-        let turn_id = handle
-            .submit(Op::StartTurn {
-                content: "hello".into(),
-                name: None,
-                turn_id: None,
-            })
-            .await
-            .unwrap();
-
-        let turn_events = handle.collect_events_for(turn_id).await;
-        assert!(turn_events
-            .iter()
-            .any(|e| matches!(e.msg, EventMsg::AgentMessage(_))));
-        assert!(turn_events
-            .iter()
-            .any(|e| matches!(e.msg, EventMsg::TurnComplete(_))));
+    /// A thread handle plus one subscription that reads from the start.
+    struct Client {
+        handle: ThreadHandle,
+        events: EventSubscription,
     }
 
-    #[tokio::test]
-    async fn thread_rejects_turn_before_configure() {
-        let (_thread, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
+    impl Client {
+        async fn new(handle: ThreadHandle) -> Self {
+            Self::after(handle, 0).await
+        }
 
-        let turn_id = handle
-            .submit(Op::StartTurn {
-                content: "hello".into(),
-                name: None,
-                turn_id: None,
-            })
-            .await
-            .unwrap();
+        async fn after(handle: ThreadHandle, log_position: u64) -> Self {
+            let events = handle.subscribe(log_position).await.unwrap();
+            Self { handle, events }
+        }
 
-        // Give the worker a moment to emit the error event.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let events = handle.collect_events_for(turn_id).await;
-        assert!(events.iter().any(|e| matches!(e.msg, EventMsg::Error(_))));
-    }
+        async fn spawn(model: Arc<dyn ModelClient>) -> Self {
+            Self::new(TapestryThread::spawn(model, test_tools()).1).await
+        }
 
-    async fn configure(handle: &ThreadHandle) {
-        let id = handle
-            .submit(Op::Configure {
-                model: "mock-model".into(),
-                system_prompt: None,
-            })
-            .await
-            .unwrap();
-        handle.collect_events_for(id).await;
-    }
+        async fn send(&mut self, command: Command) -> Vec<Event> {
+            let id = self.handle.submit(command).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.events.collect_events_for(id))
+                .await
+                .expect("no terminal event")
+                .unwrap()
+        }
 
-    async fn configure_without_time_context(handle: &ThreadHandle) {
-        configure(handle).await;
-        handle
-            .submit(Op::ThreadSettings {
-                settings: tapestry_protocol::ThreadSettings {
-                    include_time_context: Some(false),
+        async fn settings(&self, settings: ThreadSettings) {
+            self.handle
+                .submit(Command::UpdateSettings { settings })
+                .await
+                .unwrap();
+        }
+
+        async fn configure(&mut self) -> Vec<Event> {
+            self.send(Command::UpdateSettings {
+                settings: ThreadSettings {
+                    model: Some("mock-model".into()),
                     ..Default::default()
                 },
             })
             .await
-            .unwrap();
-    }
+        }
 
-    async fn turn(handle: &ThreadHandle, msg: &str, user_name: Option<&str>) -> Vec<Event> {
-        let id = handle
-            .submit(Op::StartTurn {
+        async fn configure_without_time_context(&mut self) {
+            self.configure().await;
+            self.settings(ThreadSettings {
+                include_time_context: Some(false),
+                ..Default::default()
+            })
+            .await;
+        }
+
+        async fn turn(&mut self, msg: &str, user_name: Option<&str>) -> Vec<Event> {
+            self.send(Command::StartTurn {
                 content: msg.into(),
                 name: user_name.map(str::to_string),
                 turn_id: None,
             })
             .await
-            .unwrap();
-        handle.collect_events_for(id).await
+        }
     }
 
     fn agent_text(events: &[Event]) -> String {
         events
             .iter()
             .filter_map(|e| match &e.msg {
-                EventMsg::AgentMessage(m) => Some(m.content.clone()),
+                EventMsg::AssistantMessage(m) => m.content.clone(),
                 _ => None,
             })
             .collect()
@@ -388,41 +367,141 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelClient for HistoryCountModel {
-        async fn complete(
-            &self,
-            request: tapestry_protocol::ModelRequest,
-        ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
-            Ok(tapestry_protocol::ModelResponse {
-                content: Some(format!("items={}", request.history.len())),
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+            Ok(ModelResponse {
+                content: Some(format!("items={}", request_history(&request).len())),
                 tool_calls: vec![],
                 usage: Default::default(),
             })
         }
     }
 
+    /// Echoes the system prompt it receives.
+    struct PromptEcho;
+
+    #[async_trait::async_trait]
+    impl ModelClient for PromptEcho {
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+            Ok(ModelResponse {
+                content: request.system_prompt,
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+    }
+
+    /// Behaves like [`MockModelClient`] and records every request.
+    #[derive(Default)]
+    struct RecordingModel {
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelClient for RecordingModel {
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+            self.requests.lock().unwrap().push(request.clone());
+            MockModelClient.complete(request).await
+        }
+    }
+
+    struct FailingModel;
+
+    #[async_trait::async_trait]
+    impl ModelClient for FailingModel {
+        async fn complete(&self, _: ModelRequest) -> Result<ModelResponse, CoreError> {
+            Err(CoreError::Model("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_configure_and_turn() {
+        let mut c = Client::spawn(Arc::new(MockModelClient)).await;
+        let config_events = c
+            .send(Command::UpdateSettings {
+                settings: ThreadSettings {
+                    model: Some("mock-model".into()),
+                    system_prompt: Some("test".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        match &config_events.last().unwrap().msg {
+            EventMsg::SessionConfigured(e) => assert_eq!(e.thread_id, c.handle.thread_id()),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(config_events.last().unwrap().turn_id, None);
+
+        let turn_events = c.turn("hello", None).await;
+        assert!(turn_events
+            .iter()
+            .any(|e| matches!(e.msg, EventMsg::AssistantMessage(_))));
+        assert!(matches!(
+            turn_events.last().unwrap().msg,
+            EventMsg::TurnComplete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn thread_rejects_turn_before_configure() {
+        let mut c = Client::spawn(Arc::new(MockModelClient)).await;
+        let events = c.turn("hello", None).await;
+        let last = events.last().unwrap();
+        assert!(matches!(last.msg, EventMsg::Error(_)));
+        assert_eq!(last.turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn first_settings_emit_session_configured_and_later_ones_stay_silent() {
+        let mut c = Client::spawn(Arc::new(PromptEcho)).await;
+        let events = c
+            .send(Command::UpdateSettings {
+                settings: ThreadSettings {
+                    model: Some("m1".into()),
+                    system_prompt: Some("sys".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        match events.last().map(|e| &e.msg) {
+            Some(EventMsg::SessionConfigured(e)) => assert_eq!(e.model, "m1"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        c.settings(ThreadSettings {
+            model: Some("m2".into()),
+            ..Default::default()
+        })
+        .await;
+        let events = c.turn("x", None).await;
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.msg, EventMsg::SessionConfigured(_))));
+        assert_eq!(agent_text(&events), "sys");
+    }
+
     #[tokio::test]
     async fn history_persists_across_turns() {
-        let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
-        configure_without_time_context(&handle).await;
-        assert_eq!(agent_text(&turn(&handle, "one", None).await), "items=1");
+        let mut c = Client::spawn(Arc::new(HistoryCountModel)).await;
+        c.configure_without_time_context().await;
+        assert_eq!(agent_text(&c.turn("one", None).await), "items=1");
         // user, assistant, user
-        assert_eq!(agent_text(&turn(&handle, "two", None).await), "items=3");
+        assert_eq!(agent_text(&c.turn("two", None).await), "items=3");
     }
 
     #[tokio::test]
     async fn named_user_is_rendered_for_model() {
-        let (_t, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
-        configure(&handle).await;
-        let events = turn(&handle, "hi", Some("alice")).await;
+        let mut c = Client::spawn(Arc::new(MockModelClient)).await;
+        c.configure().await;
+        let events = c.turn("hi", Some("alice")).await;
         assert_eq!(agent_text(&events), "Echo: alice: hi");
     }
 
     #[tokio::test]
     async fn invalid_user_name_errors_and_leaves_history() {
-        let (_t, handle) = TapestryThread::spawn(Arc::new(HistoryCountModel), test_tools());
-        configure_without_time_context(&handle).await;
+        let mut c = Client::spawn(Arc::new(HistoryCountModel)).await;
+        c.configure_without_time_context().await;
         for bad in ["", "   ", "a\nb"] {
-            let events = turn(&handle, "hi", Some(bad)).await;
+            let events = c.turn("hi", Some(bad)).await;
             assert!(
                 matches!(events.last().unwrap().msg, EventMsg::Error(_)),
                 "{bad:?}"
@@ -431,14 +510,13 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.msg, EventMsg::TurnStarted(_))));
         }
-        assert_eq!(agent_text(&turn(&handle, "ok", None).await), "items=1");
+        assert_eq!(agent_text(&c.turn("ok", None).await), "items=1");
     }
 
     #[tokio::test]
     async fn interrupt_reports_enum_reason() {
-        let (_t, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
-        let id = handle.submit(Op::Interrupt).await.unwrap();
-        let events = handle.collect_events_for(id).await;
+        let mut c = Client::spawn(Arc::new(MockModelClient)).await;
+        let events = c.send(Command::Interrupt).await;
         match &events.last().unwrap().msg {
             EventMsg::TurnAborted(a) => assert_eq!(a.reason, TurnAbortReason::Interrupted),
             other => panic!("unexpected {other:?}"),
@@ -447,56 +525,31 @@ mod tests {
 
     #[tokio::test]
     async fn agent_name_setting_updates_system_prompt() {
-        struct PromptModel;
-        #[async_trait::async_trait]
-        impl ModelClient for PromptModel {
-            async fn complete(
-                &self,
-                request: tapestry_protocol::ModelRequest,
-            ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
-                Ok(tapestry_protocol::ModelResponse {
-                    content: request.system_prompt,
-                    tool_calls: vec![],
-                    usage: Default::default(),
-                })
-            }
-        }
+        let mut c = Client::spawn(Arc::new(PromptEcho)).await;
+        c.configure().await;
+        assert_eq!(agent_text(&c.turn("x", None).await), "");
 
-        let (_t, handle) = TapestryThread::spawn(Arc::new(PromptModel), test_tools());
-        configure(&handle).await;
-        assert_eq!(agent_text(&turn(&handle, "x", None).await), "");
-
-        handle
-            .submit(Op::ThreadSettings {
-                settings: tapestry_protocol::ThreadSettings {
-                    agent_name: Some("planner".into()),
-                    ..Default::default()
-                },
-            })
-            .await
-            .unwrap();
-        let text = agent_text(&turn(&handle, "x", None).await);
+        c.settings(ThreadSettings {
+            agent_name: Some("planner".into()),
+            ..Default::default()
+        })
+        .await;
+        let text = agent_text(&c.turn("x", None).await);
         assert!(text.contains("planner"));
     }
 
     #[tokio::test]
     async fn thread_injects_time_context_once_per_day_and_honors_setting() {
-        use crate::clock::FixedClock;
-
         /// Echoes how many time-context entries the request history holds.
         struct ContextCountModel;
         #[async_trait::async_trait]
         impl ModelClient for ContextCountModel {
-            async fn complete(
-                &self,
-                request: tapestry_protocol::ModelRequest,
-            ) -> Result<tapestry_protocol::ModelResponse, CoreError> {
-                let n = request
-                    .history
+            async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
+                let n = request_history(&request)
                     .iter()
                     .filter(|i| matches!(i, HistoryItem::EnvironmentContext(_)))
                     .count();
-                Ok(tapestry_protocol::ModelResponse {
+                Ok(ModelResponse {
                     content: Some(n.to_string()),
                     tool_calls: vec![],
                     usage: Default::default(),
@@ -510,33 +563,354 @@ mod tests {
             test_tools(),
             clock.clone(),
         );
-        configure(&handle).await;
-        assert_eq!(agent_text(&turn(&handle, "a", None).await), "1");
-        assert_eq!(agent_text(&turn(&handle, "b", None).await), "1");
+        let mut c = Client::new(handle).await;
+        c.configure().await;
+        assert_eq!(agent_text(&c.turn("a", None).await), "1");
+        assert_eq!(agent_text(&c.turn("b", None).await), "1");
         clock.set("2026-11-05", "UTC");
-        assert_eq!(agent_text(&turn(&handle, "c", None).await), "2");
+        assert_eq!(agent_text(&c.turn("c", None).await), "2");
 
-        handle
-            .submit(Op::ThreadSettings {
-                settings: tapestry_protocol::ThreadSettings {
-                    include_time_context: Some(false),
-                    ..Default::default()
-                },
+        c.settings(ThreadSettings {
+            include_time_context: Some(false),
+            ..Default::default()
+        })
+        .await;
+        // Disabling after a send appends one "unavailable" entry.
+        assert_eq!(agent_text(&c.turn("d", None).await), "3");
+        assert_eq!(agent_text(&c.turn("e", None).await), "3");
+    }
+
+    #[tokio::test]
+    async fn turn_error_carries_turn_id_and_repairs_history() {
+        let mut c = Client::spawn(Arc::new(FailingModel)).await;
+        c.configure().await;
+        let events = c.turn("hi", None).await;
+        let started = events
+            .iter()
+            .find(|e| matches!(e.msg, EventMsg::TurnStarted(_)))
+            .unwrap();
+        let error = events.last().unwrap();
+        assert!(matches!(error.msg, EventMsg::Error(_)));
+        assert!(error.turn_id.is_some());
+        assert_eq!(error.turn_id, started.turn_id);
+    }
+
+    #[tokio::test]
+    async fn two_subscribers_each_receive_the_whole_turn() {
+        let (_t, handle) = TapestryThread::spawn(Arc::new(MockModelClient), test_tools());
+        let mut first = Client::new(handle.clone()).await;
+        let mut second = handle.subscribe(0).await.unwrap();
+        first.configure().await;
+        let id = handle
+            .submit(Command::StartTurn {
+                content: "tool:echo".into(),
+                name: None,
+                turn_id: None,
             })
             .await
             .unwrap();
-        // Disabling after a send appends one "unavailable" entry.
-        assert_eq!(agent_text(&turn(&handle, "d", None).await), "3");
-        assert_eq!(agent_text(&turn(&handle, "e", None).await), "3");
+        let (a, b) = tokio::join!(
+            first.events.collect_events_for(id),
+            second.collect_events_for(id)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        // `first` already consumed the configuration events.
+        assert_eq!(&b[b.len() - a.len()..], a.as_slice());
+        assert!(a.iter().any(|e| matches!(e.msg, EventMsg::ToolCallEnd(_))));
+        assert!(matches!(a.last().unwrap().msg, EventMsg::TurnComplete(_)));
+        let positions: Vec<_> = b.iter().map(|e| e.log_position).collect();
+        assert_eq!(positions, (1..=b.len() as u64).collect::<Vec<_>>());
     }
 
-    #[test]
-    fn replace_history_replaces_without_other_state() {
-        let mut session = Session::default();
-        session.history.push(HistoryItem::user(None, "old"));
-        session.replace_history(vec![HistoryItem::user(None, "new")]);
-        assert_eq!(session.history, vec![HistoryItem::user(None, "new")]);
-        session.replace_history(Vec::new());
-        assert!(session.history.is_empty());
+    #[tokio::test]
+    async fn store_failure_ends_submission_and_thread_keeps_running() {
+        let store = Arc::new(FlakyStore::default());
+        let (_t, handle) = TapestryThread::builder(Arc::new(MockModelClient), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut c = Client::new(handle.clone()).await;
+        c.configure_without_time_context().await;
+
+        // turn_started, user, req_start, assistant(tool call), then fail.
+        store.fail_after(4);
+        let failed = handle
+            .submit(Command::StartTurn {
+                content: "tool:echo".into(),
+                name: None,
+                turn_id: None,
+            })
+            .await
+            .unwrap();
+        // Submissions are serial, so once the next one completes the failed
+        // one has finished.
+        store.heal();
+        let events = c.turn("again", None).await;
+        assert!(matches!(
+            events.last().unwrap().msg,
+            EventMsg::TurnComplete(_)
+        ));
+        assert!(!events
+            .iter()
+            .any(|e| e.id == failed && matches!(e.msg, EventMsg::Error(_))));
+
+        let log = store.read_after(handle.thread_id(), 0).await.unwrap();
+        let history = HistoryProjection::fold(&log).history().to_vec();
+        let calls: Vec<_> = history
+            .iter()
+            .flat_map(|i| match i {
+                HistoryItem::Assistant { tool_calls, .. } => tool_calls.clone(),
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(history
+            .iter()
+            .any(|i| matches!(i, HistoryItem::ToolResult(r) if r.call_id == calls[0].id)));
+    }
+
+    #[tokio::test]
+    async fn event_snapshot_read_failure_is_reported_without_calling_model() {
+        let store = Arc::new(FlakyStore::default());
+        let model = Arc::new(RecordingModel::default());
+        let (_thread, handle) = TapestryThread::builder(model.clone(), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut client = Client::new(handle).await;
+        client.configure_without_time_context().await;
+
+        store.fail_next_read();
+        let events = client.turn("hello", None).await;
+
+        let error = events
+            .iter()
+            .find(|event| matches!(event.msg, EventMsg::Error(_)))
+            .expect("thread should report the failed snapshot read");
+        assert!(
+            events.iter().all(|event| event.id == error.id),
+            "error must retain submission id"
+        );
+        assert!(matches!(
+            &error.msg,
+            EventMsg::Error(error) if error.message.contains("read unavailable")
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::ModelRequestStarted(_))));
+        assert!(model.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_reminder_append_does_not_fall_back_to_another_model_request() {
+        let store = Arc::new(FlakyStore::default());
+        let model = Arc::new(RecordingModel::default());
+        let (_thread, handle) = TapestryThread::builder(model.clone(), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut client = Client::new(handle).await;
+        client.configure_without_time_context().await;
+        client
+            .settings(ThreadSettings {
+                max_tool_iterations: Some(1),
+                ..Default::default()
+            })
+            .await;
+
+        // The forced-finish reminder is the tenth append in this turn.
+        store.fail_once_after(9);
+        let events = client.turn("tool:echo", None).await;
+
+        let error = events
+            .iter()
+            .find(|event| matches!(event.msg, EventMsg::Error(_)))
+            .expect("thread should report the failed reminder append");
+        assert!(events.iter().all(|event| event.id == error.id));
+        assert!(matches!(
+            &error.msg,
+            EventMsg::Error(error) if error.message.contains("disk full")
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::ModelRequestStarted(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::SystemReminder(_))));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn injected_store_receives_every_event() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let (_t, handle) = TapestryThread::builder(Arc::new(MockModelClient), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut c = Client::new(handle.clone()).await;
+        c.configure().await;
+        let events = c.turn("hi", None).await;
+        let stored = store.read_after(handle.thread_id(), 0).await.unwrap();
+        assert_eq!(stored.last(), events.last());
+    }
+
+    #[tokio::test]
+    async fn live_history_equals_refolded_log() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let model = Arc::new(RecordingModel::default());
+        let clock = Arc::new(FixedClock::new("2026-11-04", "UTC"));
+        let (_t, handle) = TapestryThread::builder(model.clone(), test_tools())
+            .event_store(store.clone())
+            .clock(clock)
+            .spawn();
+        let mut c = Client::new(handle.clone()).await;
+        c.configure().await;
+        c.turn("tool:echo first", None).await;
+        c.turn("plain", Some("alice")).await;
+
+        let log = store.read_after(handle.thread_id(), 0).await.unwrap();
+        let folded = HistoryProjection::fold(&log).history().to_vec();
+        model.requests.lock().unwrap().clear();
+        c.turn("next", None).await;
+        let captured = model.requests.lock().unwrap()[0].clone();
+        let request = request_history(&captured);
+        assert_eq!(&request[..folded.len()], folded.as_slice());
+        assert_eq!(request.len(), folded.len() + 1);
+        assert_eq!(&captured.events[..log.len()], log.as_slice());
+        assert!(matches!(
+            captured.events.last().map(|event| &event.msg),
+            Some(EventMsg::ModelRequestStarted(_))
+        ));
+        assert_eq!(captured.events.len(), log.len() + 3);
+        assert!(
+            store.read_after(handle.thread_id(), 0).await.unwrap().len() > captured.events.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn reminders_remain_in_event_history_but_expire_from_later_messages() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let model = Arc::new(RecordingModel::default());
+        let (_thread, handle) = TapestryThread::builder(model.clone(), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut client = Client::new(handle).await;
+        client.configure_without_time_context().await;
+        client
+            .settings(ThreadSettings {
+                max_tool_iterations: Some(1),
+                ..Default::default()
+            })
+            .await;
+
+        client.turn("tool:echo", None).await;
+        client.turn("plain", None).await;
+
+        let next = model.requests.lock().unwrap()[2].clone();
+        assert_eq!(
+            next.events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::SystemReminder(_)))
+                .count(),
+            1
+        );
+        let reminder_text =
+            render_system_reminder(&tapestry_protocol::SystemReminder::ToolLimitReached);
+        assert!(OpenAiFormatter
+            .format(&next.events)
+            .iter()
+            .all(|message| message.content.first_text() != Some(reminder_text.as_str())));
+
+        let stored = store
+            .read_after(client.handle.thread_id(), 0)
+            .await
+            .unwrap();
+        assert!(HistoryProjection::fold(&stored)
+            .history()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::SystemReminder(_))));
+    }
+
+    #[tokio::test]
+    async fn resumed_thread_continues_history_and_log_position() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let (thread, handle) = TapestryThread::builder(Arc::new(HistoryCountModel), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let thread_id = thread.thread_id();
+        let mut c = Client::new(handle).await;
+        c.configure_without_time_context().await;
+        assert_eq!(agent_text(&c.turn("one", None).await), "items=1");
+        drop((thread, c));
+
+        store
+            .append(
+                thread_id,
+                NewEvent {
+                    id: SubmissionId::new(),
+                    turn_id: None,
+                    timestamp_ms: 10,
+                    msg: EventMsg::SystemReminder(tapestry_protocol::SystemReminderEvent {
+                        iteration: 1,
+                        reminder: tapestry_protocol::SystemReminder::ToolLimitReached,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let last_log_position = store.read_after(thread_id, 0).await.unwrap().len() as u64;
+        let resumed_model = Arc::new(RecordingModel::default());
+        let (resumed, handle) = TapestryThread::builder(resumed_model.clone(), test_tools())
+            .event_store(store.clone())
+            .resume(thread_id)
+            .await
+            .unwrap();
+        assert_eq!(resumed.thread_id(), thread_id);
+        let mut c = Client::after(handle, last_log_position).await;
+        c.configure_without_time_context().await;
+        let events = c.turn("two", None).await;
+        assert_eq!(agent_text(&events), "Echo: two");
+        let request = resumed_model.requests.lock().unwrap()[0].clone();
+        assert!(request
+            .events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::SystemReminder(_))));
+        let reminder_text =
+            render_system_reminder(&tapestry_protocol::SystemReminder::ToolLimitReached);
+        assert!(OpenAiFormatter
+            .format(&request.events)
+            .iter()
+            .all(|message| message.content.first_text() != Some(reminder_text.as_str())));
+        let log = store.read_after(thread_id, 0).await.unwrap();
+        assert!(HistoryProjection::fold(&log)
+            .history()
+            .iter()
+            .any(|item| matches!(item, HistoryItem::SystemReminder(_))));
+        let positions: Vec<_> = log.iter().map(|e| e.log_position).collect();
+        assert_eq!(positions, (1..=log.len() as u64).collect::<Vec<_>>());
+        // The resumed thread's first event directly follows the old log.
+        assert!(matches!(
+            log[last_log_position as usize].msg,
+            EventMsg::SessionConfigured(_)
+        ));
+        assert_eq!(events.last().unwrap().log_position, log.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn resumed_thread_is_unconfigured() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let (thread, handle) = TapestryThread::builder(Arc::new(MockModelClient), test_tools())
+            .event_store(store.clone())
+            .spawn();
+        let mut c = Client::new(handle).await;
+        c.configure().await;
+        c.turn("hi", None).await;
+        let thread_id = thread.thread_id();
+        drop((thread, c));
+
+        let (_t, handle) = TapestryThread::builder(Arc::new(MockModelClient), test_tools())
+            .event_store(store)
+            .resume(thread_id)
+            .await
+            .unwrap();
+        let mut c = Client::new(handle).await;
+        let events = c.turn("again", None).await;
+        assert!(matches!(events.last().unwrap().msg, EventMsg::Error(_)));
     }
 }

@@ -46,9 +46,6 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace
 
-      - name: Check tapestry-core with genai
-        run: cargo check -p tapestry-core --features genai
-
   check-wasm:
     name: check tapestry-protocol (wasm32)
     runs-on: ubuntu-latest
