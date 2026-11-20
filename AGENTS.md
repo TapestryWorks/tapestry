@@ -29,7 +29,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI 会在向 `main` 分支推送以及创建拉取请求时，使用 Rust stable 依次执行格式检查、将警告视为错误的 Clippy 检查，以及整个工作区的测试。仓库没有固定 Rust 工具链版本的配置文件。当前工作区仅包含库 crate，因此 `.gitignore` 会忽略 `Cargo.lock`。
+CI 会在向 `main` 分支推送以及创建拉取请求时，使用 Rust stable 依次执行格式检查、将警告视为错误的 Clippy 检查，以及整个工作区的测试。仓库没有固定 Rust 工具链版本的配置文件。`.gitignore` 会忽略 `Cargo.lock`。
 
 ## 架构
 
@@ -43,7 +43,7 @@ Tapestry 是一个采用 Codex SQ/EQ 设计的异步智能体内核：
 - `MockModelClient` 和 `EchoTool` 为本地开发及测试提供确定性行为。用户消息中的 `tool:echo` 等标记可以触发“模型/工具/模型”路径。
 - Workspace adapters convert the ordered event log into AG-UI 1.0 or A2A 1.0 outputs; one adapter instance handles one thread. Use `EventFilter` to opt into AG-UI `CUSTOM` payloads and call `EventAdapter::finish` when the event stream ends.
 
-`docs/architecture.md` 是架构总览及 Codex 与 Tapestry 模块映射的权威文档。其中提到的 app server、sandbox 和 CLI crate 尚处于规划阶段，不是当前工作区成员。
+`docs/architecture.md` 是架构总览及 Codex 与 Tapestry 模块映射的权威文档。其中提到的 app server 和 sandbox crate 尚处于规划阶段。`tapestry-cli` 是单轮命令行客户端，通过提交接口运行 agent，并将订阅到的事件输出为 JSON 行。
 
 ## 协议与事件约定
 

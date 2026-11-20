@@ -14,6 +14,7 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 | [`tapestry-core`](crates/tapestry-core) | Thread lifecycle, agent loop, model + tool interfaces |
 | [`tapestry-adapter-agui`](crates/tapestry-adapter-agui) | Tapestry event stream to AG-UI 1.0 events |
 | [`tapestry-adapter-a2a`](crates/tapestry-adapter-a2a) | Tapestry event stream to A2A 1.0 streaming responses |
+| [`tapestry-cli`](crates/tapestry-cli) | Run one agent turn and stream its events in the terminal |
 
 ## Quick start
 
@@ -21,6 +22,40 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 cargo test --workspace
 cargo test -p tapestry-core
 ```
+
+### Run an agent from the command line
+
+Create `.tapestry/config.yaml` in your working directory or home directory
+with your OpenAI-compatible Chat Completions settings. Use the API base URL,
+such as `https://api.openai.com/v1`, and keep your API key private.
+
+```yaml
+base_url: https://api.openai.com/v1
+api_key: "replace-with-your-api-key"
+model: gpt-4o-mini
+```
+
+Create `.tapestry/agents/reviewer.yaml` with the system prompt for the
+`reviewer` agent.
+
+```yaml
+system_prompt: |
+  You are a code reviewer. Describe any correctness issues you find.
+```
+
+For each file, the CLI checks the working directory first and falls back to
+the home directory if that file is absent. Agent names use ASCII letters,
+digits, hyphens, and underscores.
+
+```bash
+cargo run -p tapestry-cli -- -a reviewer -p "What should I check in a code review?"
+```
+
+From another project, install the binary with `cargo install --path crates/tapestry-cli`
+from this repository, then use `tapestry-cli -a reviewer -p "Your instruction"`
+from that project's directory. Each run writes one JSON event per line to
+stdout, including streamed assistant text. Failures produce a nonzero exit
+status and a diagnostic on stderr.
 
 ### Multi-provider models (genai)
 

@@ -12,6 +12,7 @@ Tapestry is a composable Rust framework for building cross-platform AI agents. T
 | `tapestry-core` | `codex-core` | Thread lifecycle, agent loop, model client trait, tool dispatch |
 | `tapestry-adapter-agui` | — | Maps Tapestry events to the AG-UI 1.0 event schema |
 | `tapestry-adapter-a2a` | — | Maps Tapestry events to the A2A 1.0 streaming response schema |
+| `tapestry-cli` | `codex-cli` | Loads an agent from YAML, submits one turn, and streams events as JSON lines |
 
 Future crates (not in scope for ALGO-14):
 
@@ -19,7 +20,6 @@ Future crates (not in scope for ALGO-14):
 |---------------|----------------|-------|
 | `tapestry-app-server` | `codex-app-server` | JSON-RPC long process for IDE/SDK integration |
 | `tapestry-sandbox-*` | sandbox crates | Platform sandboxing and process hardening |
-| `tapestry-cli` | `codex-cli` / `codex-tui` | CLI / TUI frontends |
 
 ## Communication model
 
