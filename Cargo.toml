@@ -4,6 +4,7 @@ members = [
     "crates/tapestry-core",
     "crates/tapestry-adapter-agui",
     "crates/tapestry-adapter-a2a",
+    "crates/tapestry-cli",
 ]
 resolver = "2"
 
@@ -28,3 +29,8 @@ iana-time-zone = "0.1"
 tapestry-protocol = { path = "crates/tapestry-protocol" }
 genai = "0.6"
 futures-util = { version = "0.3", default-features = false }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_yaml_ng = "0.10"
+url = "2"
+tempfile = "3"

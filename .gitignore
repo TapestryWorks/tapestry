@@ -1,5 +1,6 @@
 /target
 **/*.rs.bk
 Cargo.lock
+/.tapestry/config.yaml
 .github/prompts
 .github/skills

@@ -1,0 +1,23 @@
+[package]
+name = "tapestry-cli"
+description = "Run a Tapestry agent from the command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+url.workspace = true
+tapestry-core = { path = "../tapestry-core" }
+tapestry-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
