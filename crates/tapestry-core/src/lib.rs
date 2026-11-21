@@ -18,6 +18,7 @@ pub mod turn;
 
 pub mod genai;
 
+pub use agent::Agent;
 pub use agent::AgentLoop;
 pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
 pub use config::ThreadConfig;
@@ -49,6 +50,8 @@ pub use turn::{ModelOutputEffect, TurnMachine, TurnStep};
 
 #[cfg(test)]
 mod compatibility_tests {
+    use std::sync::Arc;
+
     #[test]
     fn grouped_model_paths_match_crate_root_exports() {
         use crate::model::{chat_model, response_model};
@@ -77,5 +80,15 @@ mod compatibility_tests {
         fn assert_type<T>() {}
         assert_type::<crate::genai::GenaiProviderConfig>();
         assert_type::<crate::genai::GenaiModelClient>();
+    }
+
+    #[test]
+    fn agent_loop_matches_the_agent_trait() {
+        let agent = crate::AgentLoop::new(
+            Arc::new(crate::MockModelClient),
+            Arc::new(crate::ToolRegistry::new()),
+        );
+        let _: &dyn crate::Agent = &agent;
+        let _: &dyn crate::agent::agent_trait::Agent = &agent;
     }
 }

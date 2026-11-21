@@ -8,7 +8,7 @@ use tapestry_protocol::{
     TurnAbortReason, TurnAbortedEvent, TurnId,
 };
 
-use crate::agent::AgentLoop;
+use crate::agent::{Agent, AgentLoop};
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
@@ -79,6 +79,7 @@ pub struct ThreadBuilder {
     tools: Arc<ToolRegistry>,
     clock: Arc<dyn Clock>,
     store: Arc<dyn EventStore>,
+    agent: Option<Arc<dyn Agent>>,
 }
 
 impl ThreadBuilder {
@@ -90,6 +91,11 @@ impl ThreadBuilder {
     /// Where the thread's events are stored; defaults to [`InMemoryEventStore`].
     pub fn event_store(mut self, store: Arc<dyn EventStore>) -> Self {
         self.store = store;
+        self
+    }
+
+    pub fn agent(mut self, agent: Arc<dyn Agent>) -> Self {
+        self.agent = Some(agent);
         self
     }
 
@@ -124,7 +130,10 @@ impl ThreadBuilder {
         };
         let recorder =
             Recorder::with_projection(self.store, self.clock.clone(), thread_id, projection);
-        let agent = AgentLoop::with_clock(self.model, self.tools, self.clock);
+        let agent: Arc<dyn Agent> = match self.agent {
+            Some(agent) => agent,
+            None => Arc::new(AgentLoop::with_clock(self.model, self.tools, self.clock)),
+        };
         tokio::spawn(run_thread_loop(submission_rx, recorder, agent));
 
         let thread = TapestryThread {
@@ -148,6 +157,7 @@ impl TapestryThread {
             tools,
             clock: Arc::new(SystemClock),
             store: Arc::new(InMemoryEventStore::new()),
+            agent: None,
         }
     }
 
@@ -175,7 +185,7 @@ impl TapestryThread {
 async fn run_thread_loop(
     mut submission_rx: mpsc::Receiver<Submission>,
     mut recorder: Recorder,
-    agent: AgentLoop,
+    agent: Arc<dyn Agent>,
 ) {
     let mut session = Session::default();
 
@@ -183,8 +193,13 @@ async fn run_thread_loop(
         debug!(submission_id = %submission.id, "processing submission");
         recorder.begin_submission(submission.id);
 
-        let result =
-            process_submission(&agent, &mut session, &mut recorder, submission.command).await;
+        let result = process_submission(
+            agent.as_ref(),
+            &mut session,
+            &mut recorder,
+            submission.command,
+        )
+        .await;
 
         match result {
             Ok(()) => {}
@@ -204,7 +219,7 @@ async fn run_thread_loop(
 }
 
 async fn process_submission(
-    agent: &AgentLoop,
+    agent: &dyn Agent,
     session: &mut Session,
     recorder: &mut Recorder,
     command: Command,
@@ -250,7 +265,7 @@ async fn process_submission(
             let turn_id = turn_id.unwrap_or_else(TurnId::new);
             session.active_turn = Some(turn_id);
             let run_result = agent
-                .run_turn(recorder, turn_id, content, name, &session.config)
+                .forward(recorder, turn_id, content, name, &session.config)
                 .await;
             session.active_turn.take();
             run_result?;

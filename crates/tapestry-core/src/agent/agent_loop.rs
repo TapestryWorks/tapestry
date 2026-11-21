@@ -18,6 +18,8 @@ use crate::recorder::Recorder;
 use crate::tool::ToolRegistry;
 use crate::turn::{TurnMachine, TurnStep};
 
+use super::Agent;
+
 /// Drives a [`TurnMachine`]: performs model/tool IO and timing, and records
 /// every step as an event.
 pub struct AgentLoop {
@@ -48,7 +50,7 @@ impl AgentLoop {
     ///
     /// On error the turn simply stops: the caller records the `Error`, and the
     /// history projection repairs unanswered tool calls when it sees it.
-    pub async fn run_turn(
+    pub async fn forward(
         &self,
         recorder: &mut Recorder,
         turn_id: TurnId,
@@ -266,6 +268,20 @@ impl AgentLoop {
             .await?;
 
         Ok(result)
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for AgentLoop {
+    async fn forward(
+        &self,
+        recorder: &mut Recorder,
+        turn_id: TurnId,
+        content: String,
+        name: Option<String>,
+        config: &ThreadConfig,
+    ) -> Result<(), CoreError> {
+        AgentLoop::forward(self, recorder, turn_id, content, name, config).await
     }
 }
 
@@ -506,7 +522,7 @@ mod tests {
             self.recorder.begin_submission(sid);
             let result = self
                 .agent
-                .run_turn(
+                .forward(
                     &mut self.recorder,
                     TurnId::new(),
                     message.into(),
@@ -786,7 +802,7 @@ mod tests {
         let mut h = Harness::without_time(Arc::new(MockModelClient), &ThreadConfig::default());
         h.recorder.begin_submission(SubmissionId::new());
         h.agent
-            .run_turn(
+            .forward(
                 &mut h.recorder,
                 TurnId::new(),
                 "hi".into(),
