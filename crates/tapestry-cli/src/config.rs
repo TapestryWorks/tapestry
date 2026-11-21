@@ -78,10 +78,12 @@ fn read_yaml<T: DeserializeOwned>(
     home: Option<&Path>,
     relative: &Path,
 ) -> Result<(T, PathBuf)> {
-    let paths: Vec<_> = std::iter::once(cwd)
-        .chain(home.filter(|home| *home != cwd))
-        .map(|root| root.join(".tapestry").join(relative))
-        .collect();
+    let agents_relative = relative.strip_prefix("agents").unwrap_or(relative);
+    let mut paths = Vec::new();
+    for root in std::iter::once(cwd).chain(home.filter(|home| *home != cwd)) {
+        paths.push(root.join(".tapestry").join(relative));
+        paths.push(root.join(".agents").join(agents_relative));
+    }
 
     for path in &paths {
         let contents = match fs::read_to_string(path) {
@@ -112,34 +114,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn looks_up_each_file_in_cwd_then_home() {
+    fn looks_up_files_in_tapestry_then_agents_then_home() {
         let cwd = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let local = cwd.path().join(".tapestry");
-        let global = home.path().join(".tapestry");
-        fs::create_dir_all(local.join("agents")).unwrap();
-        fs::create_dir_all(global.join("agents")).unwrap();
+        let local_tapestry = cwd.path().join(".tapestry");
+        let local_agents = cwd.path().join(".agents");
+        let home_tapestry = home.path().join(".tapestry");
+        let home_agents = home.path().join(".agents");
+        for dir in [
+            local_tapestry.join("agents"),
+            local_agents.clone(),
+            home_tapestry.join("agents"),
+            home_agents.clone(),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let model_config = |model: &str| {
+            format!("base_url: https://example.com/v1\napi_key: test-key\nmodel: {model}")
+        };
         fs::write(
-            global.join("config.yaml"),
-            "base_url: https://example.com/v1\napi_key: test-key\nmodel: global",
+            local_tapestry.join("config.yaml"),
+            model_config("local-tapestry"),
         )
         .unwrap();
-        fs::write(global.join("agents/reviewer.yaml"), "system_prompt: Global").unwrap();
-        fs::write(local.join("agents/reviewer.yaml"), "system_prompt: Local").unwrap();
+        fs::write(
+            local_agents.join("config.yaml"),
+            model_config("local-agents"),
+        )
+        .unwrap();
+        fs::write(
+            home_tapestry.join("config.yaml"),
+            model_config("home-tapestry"),
+        )
+        .unwrap();
+        fs::write(home_agents.join("config.yaml"), model_config("home-agents")).unwrap();
+        fs::write(
+            local_agents.join("reviewer.yaml"),
+            "system_prompt: Local agents",
+        )
+        .unwrap();
+        fs::write(
+            home_tapestry.join("agents/reviewer.yaml"),
+            "system_prompt: Home tapestry",
+        )
+        .unwrap();
+        fs::write(
+            home_agents.join("reviewer.yaml"),
+            "system_prompt: Home agents",
+        )
+        .unwrap();
 
         let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
-        assert_eq!(model.model, "global");
-        assert_eq!(prompt, "Local");
+        assert_eq!(model.model, "local-tapestry");
+        assert_eq!(prompt, "Local agents");
+
+        fs::remove_file(local_tapestry.join("config.yaml")).unwrap();
+        fs::write(
+            local_tapestry.join("agents/reviewer.yaml"),
+            "system_prompt: Local tapestry",
+        )
+        .unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        assert_eq!(model.model, "local-agents");
+        assert_eq!(prompt, "Local tapestry");
+
+        fs::remove_file(local_agents.join("config.yaml")).unwrap();
+        fs::remove_file(local_tapestry.join("agents/reviewer.yaml")).unwrap();
+        fs::remove_file(local_agents.join("reviewer.yaml")).unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        assert_eq!(model.model, "home-tapestry");
+        assert_eq!(prompt, "Home tapestry");
+
+        fs::remove_file(home_tapestry.join("config.yaml")).unwrap();
+        fs::remove_file(home_tapestry.join("agents/reviewer.yaml")).unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        assert_eq!(model.model, "home-agents");
+        assert_eq!(prompt, "Home agents");
 
         fs::write(
-            local.join("config.yaml"),
+            home_agents.join("config.yaml"),
             "base_url: https://example.com/v1\napi_key: [sensitive-test-value]\nmodel: local",
         )
         .unwrap();
         let error = load(cwd.path(), Some(home.path()), "reviewer")
             .unwrap_err()
             .to_string();
-        assert!(error.contains(&local.join("config.yaml").display().to_string()));
+        assert!(error.contains(&home_agents.join("config.yaml").display().to_string()));
         assert!(!error.contains("sensitive-test-value"));
     }
 

@@ -35,17 +35,19 @@ api_key: "replace-with-your-api-key"
 model: gpt-4o-mini
 ```
 
-Create `.tapestry/agents/reviewer.yaml` with the system prompt for the
-`reviewer` agent.
+Create `.tapestry/agents/reviewer.yaml` or `.agents/reviewer.yaml` with the
+system prompt for the `reviewer` agent.
 
 ```yaml
 system_prompt: |
   You are a code reviewer. Describe any correctness issues you find.
 ```
 
-For each file, the CLI checks the working directory first and falls back to
-the home directory if that file is absent. Agent names use ASCII letters,
-digits, hyphens, and underscores.
+The CLI checks configuration files in this order: working-directory
+`.tapestry`, working-directory `.agents`, home-directory `.tapestry`, then
+home-directory `.agents`. Model settings use `config.yaml` in either directory;
+agent settings use `agents/<name>.yaml` in `.tapestry` and `<name>.yaml` in
+`.agents`. Agent names use ASCII letters, digits, hyphens, and underscores.
 
 ```bash
 cargo run -p tapestry-cli -- -a reviewer -p "What should I check in a code review?"

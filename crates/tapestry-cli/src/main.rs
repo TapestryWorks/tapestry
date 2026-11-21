@@ -14,7 +14,7 @@ use tapestry_protocol::{Command, EventMsg, SubmissionId, ThreadSettings};
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Agent name in .tapestry/agents.
+    /// Agent name in .tapestry/agents or .agents.
     #[arg(short, long)]
     agent: String,
 
