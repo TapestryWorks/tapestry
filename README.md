@@ -35,8 +35,9 @@ api_key: "replace-with-your-api-key"
 model: gpt-4o-mini
 ```
 
-Create `.tapestry/agents/reviewer.yaml` or `.agents/reviewer.yaml` with the
-system prompt for the `reviewer` agent.
+Optionally, create `.tapestry/agents/reviewer.yaml` or `.agents/reviewer.yaml`
+with the system prompt for the `reviewer` agent. Without `-a`, the CLI uses the
+built-in system prompt `You are a helpful assistant.`
 
 ```yaml
 system_prompt: |
@@ -51,13 +52,15 @@ agent settings use `agents/<name>.yaml` in `.tapestry` and `<name>.yaml` in
 
 ```bash
 cargo run -p tapestry-cli -- -a reviewer -p "What should I check in a code review?"
+cargo run -p tapestry-cli -- -p "Hello"
 ```
 
 From another project, install the binary with `cargo install --path crates/tapestry-cli`
 from this repository, then use `tapestry-cli -a reviewer -p "Your instruction"`
-from that project's directory. Each run writes one JSON event per line to
-stdout, including streamed assistant text. Failures produce a nonzero exit
-status and a diagnostic on stderr.
+from that project's directory. Each run prints tool calls
+(`tool call: name(args)`), tool results (`tool result: name: output`) and the
+assistant's final text to stdout. Failures produce a nonzero exit status and a
+diagnostic on stderr.
 
 ### Multi-provider models (genai)
 

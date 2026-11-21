@@ -12,7 +12,8 @@ Tapestry is a composable Rust framework for building cross-platform AI agents. T
 | `tapestry-core` | `codex-core` | Thread lifecycle, agent loop, model client trait, tool dispatch |
 | `tapestry-adapter-agui` | — | Maps Tapestry events to the AG-UI 1.0 event schema |
 | `tapestry-adapter-a2a` | — | Maps Tapestry events to the A2A 1.0 streaming response schema |
-| `tapestry-cli` | `codex-cli` | Loads an agent from YAML, submits one turn, and streams events as JSON lines |
+| `tapestry-adapter-cli` | — | Filters and renders Tapestry events as human-readable command-line text (tool calls, tool results and assistant messages only) |
+| `tapestry-cli` | `codex-cli` | Loads model settings and an optional agent from YAML (default system prompt `You are a helpful assistant.`), submits one turn, and prints tool calls, tool results and assistant messages as text lines (via `tapestry-adapter-cli`) |
 
 Future crates (not in scope for ALGO-14):
 
@@ -126,7 +127,7 @@ adapter -> event
 `TurnStep` and `ModelOutputEffect` (driver ↔ state machine) are internal to `tapestry-core::turn`, not protocol types.
 
 - `ToolCallId` is the provider's original call id; it is generated (`call_` + UUID) only when the provider gives none. Treat it as opaque.
-- Event adapters live in separate protocol-specific crates. They consume one thread's events in sequence and may map each input event to zero or more outputs; `EventAdapter::finish` flushes terminal output when a subscription ends. `EventFilter` selects intrinsic event categories consistently across adapters.
+- Event adapters live in separate protocol-specific crates. They consume one thread's events in sequence and may map each input event to zero or more outputs; `EventAdapter::finish` flushes terminal output when a subscription ends. `EventFilter` selects intrinsic event categories consistently across adapters. `tapestry-adapter-cli`'s `CliEventAdapter` emits a `CliOutput` only for `ToolCallBegin`, `ToolCallEnd` and `AssistantMessage` with text, and drops everything else; its `Display` renders `tool call: name(args)`, `tool result: name: output` (with `(failed)`/`(not found)` after the name when not completed) and the assistant content as-is. `CliAdapterOptions::include_deltas` additionally emits raw `AssistantMessageDelta` text. `tapestry-cli` uses the default options and still detects submission completion from the unfiltered events, reporting `Error`/`TurnAborted` details on stderr with a failing exit status.
 - `ToolResult { call_id, tool_name, output, status }` is the single result type: tools return it, `ToolCallEnd` carries it, and the projection stores it in history. After a tool runs, `AgentLoop` overwrites `call_id`/`tool_name` with those of the call.
 - `TokenUsage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }` (`u64`). `input_tokens` excludes cache reads/writes (genai's total prompt tokens are split accordingly); `output_tokens` includes reasoning. `total_tokens` is derived: written on serialization, ignored on deserialization.
 

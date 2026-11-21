@@ -14,6 +14,9 @@ struct ModelConfig {
     model: String,
 }
 
+/// System prompt used when no agent is selected.
+pub(crate) const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+
 #[derive(Deserialize)]
 struct AgentConfig {
     system_prompt: String,
@@ -22,8 +25,21 @@ struct AgentConfig {
 pub(crate) fn load(
     cwd: &Path,
     home: Option<&Path>,
-    agent_name: &str,
+    agent_name: Option<&str>,
 ) -> Result<(GenaiProviderConfig, String)> {
+    if let Some(agent_name) = agent_name {
+        validate_agent_name(agent_name)?;
+    }
+    let (model, model_path): (ModelConfig, _) = read_yaml(cwd, home, Path::new("config.yaml"))?;
+    let provider = provider_config(model, &model_path)?;
+    let system_prompt = match agent_name {
+        Some(agent_name) => load_agent(cwd, home, agent_name)?,
+        None => DEFAULT_SYSTEM_PROMPT.to_owned(),
+    };
+    Ok((provider, system_prompt))
+}
+
+fn validate_agent_name(agent_name: &str) -> Result<()> {
     ensure!(
         !agent_name.is_empty()
             && agent_name
@@ -31,11 +47,21 @@ pub(crate) fn load(
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "agent name must contain only ASCII letters, digits, hyphens, or underscores"
     );
+    Ok(())
+}
 
+fn load_agent(cwd: &Path, home: Option<&Path>, agent_name: &str) -> Result<String> {
     let agent_file = Path::new("agents").join(format!("{agent_name}.yaml"));
-    let (model, model_path): (ModelConfig, _) = read_yaml(cwd, home, Path::new("config.yaml"))?;
     let (agent, agent_path): (AgentConfig, _) = read_yaml(cwd, home, &agent_file)?;
+    ensure!(
+        !agent.system_prompt.trim().is_empty(),
+        "{}: system_prompt is empty",
+        agent_path.display()
+    );
+    Ok(agent.system_prompt)
+}
 
+fn provider_config(model: ModelConfig, model_path: &Path) -> Result<GenaiProviderConfig> {
     let endpoint = Url::parse(model.base_url.trim()).ok().filter(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.has_host()
@@ -61,16 +87,9 @@ pub(crate) fn load(
         "{}: api_key is empty",
         model_path.display()
     );
-    ensure!(
-        !agent.system_prompt.trim().is_empty(),
-        "{}: system_prompt is empty",
-        agent_path.display()
-    );
-
-    let provider = GenaiProviderConfig::new(model.model.trim())
+    Ok(GenaiProviderConfig::new(model.model.trim())
         .with_endpoint(endpoint.as_str())
-        .with_api_key(model.api_key.trim());
-    Ok((provider, agent.system_prompt))
+        .with_api_key(model.api_key.trim()))
 }
 
 fn read_yaml<T: DeserializeOwned>(
@@ -164,7 +183,7 @@ mod tests {
         )
         .unwrap();
 
-        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), Some("reviewer")).unwrap();
         assert_eq!(model.model, "local-tapestry");
         assert_eq!(prompt, "Local agents");
 
@@ -174,20 +193,20 @@ mod tests {
             "system_prompt: Local tapestry",
         )
         .unwrap();
-        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), Some("reviewer")).unwrap();
         assert_eq!(model.model, "local-agents");
         assert_eq!(prompt, "Local tapestry");
 
         fs::remove_file(local_agents.join("config.yaml")).unwrap();
         fs::remove_file(local_tapestry.join("agents/reviewer.yaml")).unwrap();
         fs::remove_file(local_agents.join("reviewer.yaml")).unwrap();
-        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), Some("reviewer")).unwrap();
         assert_eq!(model.model, "home-tapestry");
         assert_eq!(prompt, "Home tapestry");
 
         fs::remove_file(home_tapestry.join("config.yaml")).unwrap();
         fs::remove_file(home_tapestry.join("agents/reviewer.yaml")).unwrap();
-        let (model, prompt) = load(cwd.path(), Some(home.path()), "reviewer").unwrap();
+        let (model, prompt) = load(cwd.path(), Some(home.path()), Some("reviewer")).unwrap();
         assert_eq!(model.model, "home-agents");
         assert_eq!(prompt, "Home agents");
 
@@ -196,7 +215,7 @@ mod tests {
             "base_url: https://example.com/v1\napi_key: [sensitive-test-value]\nmodel: local",
         )
         .unwrap();
-        let error = load(cwd.path(), Some(home.path()), "reviewer")
+        let error = load(cwd.path(), Some(home.path()), Some("reviewer"))
             .unwrap_err()
             .to_string();
         assert!(error.contains(&home_agents.join("config.yaml").display().to_string()));
@@ -204,8 +223,35 @@ mod tests {
     }
 
     #[test]
+    fn uses_the_default_system_prompt_without_an_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let tapestry = cwd.path().join(".tapestry");
+        fs::create_dir_all(&tapestry).unwrap();
+        fs::write(
+            tapestry.join("config.yaml"),
+            "base_url: https://example.com/v1\napi_key: test-key\nmodel: m",
+        )
+        .unwrap();
+
+        let (model, prompt) = load(cwd.path(), None, None).unwrap();
+        assert_eq!(model.model, "m");
+        assert_eq!(prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(prompt, "You are a helpful assistant.");
+
+        let error = load(cwd.path(), None, Some("missing")).unwrap_err();
+        assert!(error.to_string().contains("configuration file not found"));
+    }
+
+    #[test]
+    fn requires_model_config_without_an_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let error = load(cwd.path(), None, None).unwrap_err();
+        assert!(error.to_string().contains("config.yaml"));
+    }
+
+    #[test]
     fn rejects_agent_names_that_can_escape_the_agents_directory() {
-        let error = load(Path::new("."), None, "../reviewer").unwrap_err();
+        let error = load(Path::new("."), None, Some("../reviewer")).unwrap_err();
         assert!(error.to_string().contains("agent name"));
     }
 }

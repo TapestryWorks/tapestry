@@ -1,0 +1,12 @@
+[package]
+name = "tapestry-adapter-cli"
+description = "Command-line output adapter for Tapestry event streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+tapestry-protocol = { workspace = true }

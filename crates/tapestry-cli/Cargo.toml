@@ -15,6 +15,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio.workspace = true
 url.workspace = true
+tapestry-adapter-cli = { path = "../tapestry-adapter-cli" }
 tapestry-core = { path = "../tapestry-core" }
 tapestry-protocol.workspace = true
 

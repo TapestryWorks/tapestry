@@ -4,6 +4,7 @@ members = [
     "crates/tapestry-core",
     "crates/tapestry-adapter-agui",
     "crates/tapestry-adapter-a2a",
+    "crates/tapestry-adapter-cli",
     "crates/tapestry-cli",
 ]
 resolver = "2"
