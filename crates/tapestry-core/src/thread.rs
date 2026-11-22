@@ -8,7 +8,7 @@ use tapestry_protocol::{
     TurnAbortReason, TurnAbortedEvent, TurnId,
 };
 
-use crate::agent::{Agent, AgentLoop};
+use crate::agent::AgentLoop;
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
@@ -79,7 +79,7 @@ pub struct ThreadBuilder {
     tools: Arc<ToolRegistry>,
     clock: Arc<dyn Clock>,
     store: Arc<dyn EventStore>,
-    agent: Option<Arc<dyn Agent>>,
+    agent_loop: Option<AgentLoop>,
 }
 
 impl ThreadBuilder {
@@ -94,8 +94,8 @@ impl ThreadBuilder {
         self
     }
 
-    pub fn agent(mut self, agent: Arc<dyn Agent>) -> Self {
-        self.agent = Some(agent);
+    pub fn agent_loop(mut self, agent_loop: AgentLoop) -> Self {
+        self.agent_loop = Some(agent_loop);
         self
     }
 
@@ -130,11 +130,11 @@ impl ThreadBuilder {
         };
         let recorder =
             Recorder::with_projection(self.store, self.clock.clone(), thread_id, projection);
-        let agent: Arc<dyn Agent> = match self.agent {
-            Some(agent) => agent,
+        let agent_loop = match self.agent_loop {
+            Some(agent_loop) => Arc::new(agent_loop),
             None => Arc::new(AgentLoop::with_clock(self.model, self.tools, self.clock)),
         };
-        tokio::spawn(run_thread_loop(submission_rx, recorder, agent));
+        tokio::spawn(run_thread_loop(submission_rx, recorder, agent_loop));
 
         let thread = TapestryThread {
             thread_id,
@@ -157,7 +157,7 @@ impl TapestryThread {
             tools,
             clock: Arc::new(SystemClock),
             store: Arc::new(InMemoryEventStore::new()),
-            agent: None,
+            agent_loop: None,
         }
     }
 
@@ -185,7 +185,7 @@ impl TapestryThread {
 async fn run_thread_loop(
     mut submission_rx: mpsc::Receiver<Submission>,
     mut recorder: Recorder,
-    agent: Arc<dyn Agent>,
+    agent_loop: Arc<AgentLoop>,
 ) {
     let mut session = Session::default();
 
@@ -194,7 +194,7 @@ async fn run_thread_loop(
         recorder.begin_submission(submission.id);
 
         let result = process_submission(
-            agent.as_ref(),
+            agent_loop.as_ref(),
             &mut session,
             &mut recorder,
             submission.command,
@@ -219,7 +219,7 @@ async fn run_thread_loop(
 }
 
 async fn process_submission(
-    agent: &dyn Agent,
+    agent_loop: &AgentLoop,
     session: &mut Session,
     recorder: &mut Recorder,
     command: Command,
@@ -264,7 +264,7 @@ async fn process_submission(
 
             let turn_id = turn_id.unwrap_or_else(TurnId::new);
             session.active_turn = Some(turn_id);
-            let run_result = agent
+            let run_result = agent_loop
                 .forward(recorder, turn_id, content, name, &session.config)
                 .await;
             session.active_turn.take();
@@ -282,10 +282,12 @@ mod tests {
     use std::time::Duration;
 
     use tapestry_protocol::{
-        Event, EventMsg, HistoryItem, ModelRequest, ModelResponse, ThreadSettings,
+        Event, EventMsg, FinishReason, HistoryItem, ModelRequest, ModelResponse, SystemReminder,
+        ThreadSettings, ToolCall, ToolResult,
     };
 
     use super::*;
+    use crate::agent::{Agent, TurnStep};
     use crate::clock::FixedClock;
     use crate::formatter::prompt::render_system_reminder;
     use crate::formatter::{Formatter, OpenAiFormatter};
@@ -650,7 +652,7 @@ mod tests {
             },
         ));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
-            .agent(Arc::new(agent))
+            .agent_loop(agent)
             .spawn();
         let mut client = Client::new(handle.clone()).await;
         client.configure_without_time_context().await;
@@ -692,7 +694,7 @@ mod tests {
             },
         ));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
-            .agent(Arc::new(agent))
+            .agent_loop(agent)
             .spawn();
         let mut client = Client::new(handle).await;
         client.configure_without_time_context().await;
@@ -711,6 +713,81 @@ mod tests {
                 EventMsg::TurnComplete(_)
             ));
         }
+    }
+
+    struct ThreadPolicy {
+        finished: bool,
+    }
+
+    impl Agent for ThreadPolicy {
+        fn next_step(&self) -> TurnStep {
+            if self.finished {
+                TurnStep::Done {
+                    finish: FinishReason::ExceedMaxIters,
+                    last_agent_message: Some("selected by policy".into()),
+                }
+            } else {
+                TurnStep::CallModel {
+                    allow_tools: false,
+                    reminder: Some(SystemReminder::ToolLimitReached),
+                }
+            }
+        }
+
+        fn on_model_output(
+            &mut self,
+            _content: Option<&str>,
+            _tool_calls: &[ToolCall],
+        ) -> Result<Vec<ToolCall>, CoreError> {
+            self.finished = true;
+            Ok(Vec::new())
+        }
+
+        fn on_tool_results(&mut self, _results: &[ToolResult]) -> Result<(), CoreError> {
+            Err(CoreError::Internal(
+                "thread policy unexpectedly received tool results".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_uses_custom_policy_from_agent_loop_factory() {
+        let model: Arc<dyn ModelClient> = Arc::new(MockModelClient);
+        let loop_with_policy = AgentLoop::new(model.clone(), test_tools())
+            .with_agent_factory(|_| Box::new(ThreadPolicy { finished: false }));
+        let (_thread, handle) = TapestryThread::builder(model, test_tools())
+            .agent_loop(loop_with_policy)
+            .spawn();
+        let mut client = Client::new(handle.clone()).await;
+        client.configure_without_time_context().await;
+        let submission = handle
+            .submit(Command::StartTurn {
+                content: "hello".into(),
+                name: None,
+                turn_id: None,
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.events.collect_events_for(submission),
+        )
+        .await
+        .expect("no terminal event")
+        .unwrap();
+
+        assert!(events.iter().any(|event| {
+            event.id == submission
+                && matches!(
+                    &event.msg,
+                    EventMsg::TurnComplete(complete)
+                        if complete.finish_reason == FinishReason::ExceedMaxIters
+                            && complete.last_agent_message.as_deref() == Some("selected by policy")
+                )
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::Error(_))));
     }
 
     #[tokio::test]

@@ -95,7 +95,7 @@ Repair happens only in the projection (no compensating events): when a turn is c
 | `protocol.rs` — `Submission`, `Op`, `Event`, `EventMsg` | `tapestry-protocol::{submission, event}` | `Command` replaces `Op`; reduced command/event set for v1 |
 | `codex_thread.rs` — thread lifecycle | `tapestry-core::thread` | `TapestryThread`, `ThreadBuilder`, `ThreadHandle` |
 | rollout recording | `tapestry-core::{store, recorder}` | `EventStore`, `InMemoryEventStore`, `EventSubscription`, `Recorder` |
-| `agent/` — turn control & loop | `tapestry-core::{turn, agent}` | `TurnMachine` (pure decisions) + `AgentLoop::run_turn` (IO driver) |
+| `agent/` — turn policy & driver | `tapestry-core::agent` | `Agent` policy (`ReactAgent` by default) + `AgentLoop::forward` (IO driver) |
 | conversation history | `tapestry-protocol::model` (`HistoryItem`), `tapestry-core::formatter::formatter_trait` | `HistoryProjection` folds events and repairs unfinished turns |
 | model invocation | `tapestry-protocol::model` (types), `tapestry-core::model` (behavior) | `ChatModel` (`complete`, `stream`), `ResponseModel` (`respond`, `stream`), shared `ModelStream`, and a mock for each trait |
 | provider integrations | `tapestry-core::model::genai` | Provider configuration, request/response mapping, and the genai-backed `GenaiModelClient` |
@@ -124,7 +124,7 @@ adapter -> event
 | `event` | `Event`, `EventMsg` and the event payloads |
 | `adapter` | Protocol-independent event categories, filters and the `EventAdapter` conversion contract; depends on `event`, not on core or a target protocol |
 
-`TurnStep` and `ModelOutputEffect` (driver ↔ state machine) are internal to `tapestry-core::turn`, not protocol types.
+`TurnStep` is an internal driver-policy type in `tapestry-core::agent`, not a protocol type.
 
 - `ToolCallId` is the provider's original call id; it is generated (`call_` + UUID) only when the provider gives none. Treat it as opaque.
 - Event adapters live in separate protocol-specific crates. They consume one thread's events in sequence and may map each input event to zero or more outputs; `EventAdapter::finish` flushes terminal output when a subscription ends. `EventFilter` selects intrinsic event categories consistently across adapters. `tapestry-adapter-cli`'s `CliEventAdapter` emits a `CliOutput` only for `ToolCallBegin`, `ToolCallEnd` and `AssistantMessage` with text, and drops everything else; its `Display` renders `tool call: name(args)`, `tool result: name: output` (with `(failed)`/`(not found)` after the name when not completed) and the assistant content as-is. `CliAdapterOptions::include_deltas` additionally emits raw `AssistantMessageDelta` text. `tapestry-cli` uses the default options and still detects submission completion from the unfiltered events, reporting `Error`/`TurnAborted` details on stderr with a failing exit status.
@@ -135,7 +135,11 @@ adapter -> event
 
 ### State machine and driver
 
-`TurnMachine` is synchronous and performs no IO. It exposes `next_step()` (`CallModel`, `RunTools`, `Done`) and is advanced by `on_model_output` (which returns the `AssistantMessage` to record) / `on_tool_results`. It holds no history. `AgentLoop::run_turn` is the async driver: it performs the step, times tools, and records every event through the `Recorder`; before each model call it reads a fresh immutable event snapshot. `RunTools` is a batch so parallel execution can be added later.
+`Agent` is a synchronous, per-turn policy that performs no IO. Its `next_step()` requests a model call or ends the turn; `on_model_output` chooses an unchanged, ordered subsequence of tool calls, and `on_tool_results` receives the paired results. The default `ReactAgent` preserves the usual ReAct behavior. `AgentFactory` creates a fresh policy from the current `ThreadConfig` for every turn.
+
+`AgentLoop` is the async driver: it owns the model, tool, middleware, clock and event-store interactions, counts model iterations, and records all events through the `Recorder`. Before each model call it reads a fresh immutable event snapshot. The driver validates that retained calls are an exact ordered subsequence of the model output, rejects retained calls when tools are disabled, enforces a `max_tool_iterations + 1` model-call ceiling, and emits warnings for dropped calls. It executes the retained calls inline so `ModelRequestCompleted(i)` still encloses that iteration's assistant and tool events. Policies cannot access the recorder or bypass these event invariants.
+
+**Breaking migration:** replace custom `Agent::forward` implementations that performed whole turns with a synchronous per-turn `Agent` policy, then install it with `AgentLoop::with_agent_factory`. Inject the configured driver with `ThreadBuilder::agent_loop(AgentLoop)`. Use middleware for request/response/tool transformations; the policy itself must not perform IO or record events.
 
 ### Middleware hooks
 
@@ -152,7 +156,7 @@ Before hooks run in registration order; after hooks unwind in reverse order:
   `TokenCount` and `TurnComplete`.
 - `before_model` runs after the request snapshot is assembled and before
   `ModelClient::stream`; `after_model` runs after the final response and before
-  assistant output is passed to the turn machine. Rewritten final content,
+  assistant output is passed to the turn policy. Rewritten final content,
   tool calls, and usage drive subsequent events/history; already-recorded text
   deltas are unchanged.
 - `before_tool` runs before `ToolCallBegin`. It may rewrite arguments or return
@@ -180,7 +184,7 @@ when resuming a thread.
 
 - A model output without tool calls ends the turn with `finish_reason: completed`.
 - Tool calls are executed in order and their results fed back; unknown tools (`not_found`) and failures (`failed`) are results, not errors, and the loop continues.
-- After `max_tool_iterations` model calls that still requested tools, the machine runs those tools, then makes one more call with no tools and records a `SystemReminder::ToolLimitReached` event before reading the event snapshot. The reminder remains in projected history and is formatted into that request; later user, assistant, or tool-result entries make it expire from the model-message view. The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted.
+- The default `ReactAgent` runs tools for up to `max_tool_iterations` model calls, then makes one more call with no tools and records a `SystemReminder::ToolLimitReached` event before reading the event snapshot. The reminder remains in projected history and is formatted into that request; later user, assistant, or tool-result entries make it expire from the model-message view. The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted. Custom policies may choose different turn flows but cannot exceed `max_tool_iterations + 1` model calls.
 - On model failure the turn returns an error (the thread records `Error` with the turn's `turn_id`), and the projection gives every unanswered tool call a `failed` result so later requests stay valid. On an event-store failure, the thread attempts to record the submission error; an unavailable store may reject that error append too, and the open turn is repaired when the next turn starts or the log is folded.
 
 ### History and names
@@ -229,7 +233,7 @@ sequenceDiagram
     participant Client
     participant Thread as TapestryThread
     participant Loop as AgentLoop
-    participant Machine as TurnMachine
+    participant Policy as Agent
     participant Model as ModelClient
     participant Tools as ToolRegistry
 
@@ -239,15 +243,15 @@ sequenceDiagram
     Client->>Thread: Command::StartTurn
     Thread-->>Client: TurnStarted, UserMessage
     loop until Done
-        Loop->>Machine: next_step()
+        Loop->>Policy: next_step()
         Loop->>Model: stream(history, tools)
         Loop-->>Client: AssistantMessageStart / AssistantMessageDelta*
-        Loop->>Machine: on_model_output
+        Loop->>Policy: on_model_output
         Loop-->>Client: AssistantMessage
         opt tool calls
             Loop->>Tools: execute
             Loop-->>Client: ToolCallBegin / ToolCallEnd
-            Loop->>Machine: on_tool_results
+            Loop->>Policy: on_tool_results
         end
     end
     Loop-->>Client: TokenCount
@@ -286,7 +290,7 @@ sequenceDiagram
 ## Testing strategy
 
 - **Protocol:** serde round-trip unit tests for every public request/event type
-- **Core:** `TurnMachine` is unit-tested without IO; `InMemoryEventStore` and `HistoryProjection` have their own unit tests (ordering, replay, repair); `AgentLoop` tests assert the event-order contract with scripted models; `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word); scripted stream clients cover delta, fallback and mid-stream failure cases
+- **Core:** `ReactAgent` is unit-tested without IO; `AgentLoop` tests cover custom policies, driver invariants and event ordering with scripted models; `InMemoryEventStore` and `HistoryProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word); scripted stream clients cover delta, fallback and mid-stream failure cases
 - **Integration:** `TapestryThread` end-to-end tests via `ThreadHandle` and `EventSubscription`, including resume from a stored log
 
 Run locally:

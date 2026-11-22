@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tapestry_protocol::{
-    AssistantMessageDeltaEvent, AssistantMessageStartEvent, EnvironmentContextUpdatedEvent,
-    EventMsg, MessageId, ModelRequest, ModelRequestCompletedEvent, ModelRequestStartedEvent,
-    ModelResponse, ModelStreamItem, SystemReminderEvent, TokenCountEvent, TokenUsage, ToolCall,
-    ToolCallBeginEvent, ToolCallEndEvent, ToolResult, TurnCompleteEvent, TurnId, TurnStartedEvent,
-    UserMessageEvent, WarningEvent,
+    AssistantMessageDeltaEvent, AssistantMessageEvent, AssistantMessageStartEvent,
+    EnvironmentContextUpdatedEvent, EventMsg, MessageId, ModelRequest, ModelRequestCompletedEvent,
+    ModelRequestStartedEvent, ModelResponse, ModelStreamItem, SystemReminderEvent, TokenCountEvent,
+    TokenUsage, ToolCall, ToolCallBeginEvent, ToolCallEndEvent, ToolResult, TurnCompleteEvent,
+    TurnId, TurnStartedEvent, UserMessageEvent, WarningEvent,
 };
 
 use crate::clock::{Clock, SystemClock};
@@ -17,17 +17,17 @@ use crate::middleware::{HookCtx, Middleware, ToolDecision};
 use crate::model::ModelClient;
 use crate::recorder::Recorder;
 use crate::tool::ToolRegistry;
-use crate::turn::{TurnMachine, TurnStep};
 
-use super::Agent;
+use super::{Agent, AgentFactory, ReactAgent, TurnStep};
 
-/// Drives a [`TurnMachine`]: performs model/tool IO and timing, and records
-/// every step as an event.
+/// Drives per-turn [`Agent`] policies: performs model/tool IO and timing, and
+/// records every step as an event.
 pub struct AgentLoop {
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
     clock: Arc<dyn Clock>,
     middlewares: Vec<Arc<dyn Middleware>>,
+    agent_factory: AgentFactory,
 }
 
 impl AgentLoop {
@@ -45,7 +45,16 @@ impl AgentLoop {
             tools,
             clock,
             middlewares: Vec::new(),
+            agent_factory: Arc::new(|config| Box::new(ReactAgent::new(config.max_tool_iterations))),
         }
+    }
+
+    pub fn with_agent_factory(
+        mut self,
+        factory: impl Fn(&ThreadConfig) -> Box<dyn Agent> + Send + Sync + 'static,
+    ) -> Self {
+        self.agent_factory = Arc::new(factory);
+        self
     }
 
     pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
@@ -102,19 +111,27 @@ impl AgentLoop {
             .record(EventMsg::UserMessage(UserMessageEvent { name, content }))
             .await?;
 
-        let mut machine = TurnMachine::new(config.max_tool_iterations);
+        let mut agent = (self.agent_factory)(config);
         let mut total = TokenUsage::default();
+        let mut iteration: u64 = 0;
 
         let (finish_reason, last_agent_message) = loop {
-            match machine.next_step() {
+            match agent.next_step() {
                 TurnStep::CallModel {
-                    iteration,
                     allow_tools,
                     reminder,
                 } => {
+                    if iteration > u64::from(config.max_tool_iterations) {
+                        return Err(CoreError::Internal(format!(
+                            "agent requested more than {} model calls",
+                            u64::from(config.max_tool_iterations) + 1
+                        )));
+                    }
+                    let model_iteration = u32::try_from(iteration)
+                        .map_err(|_| CoreError::Internal("model iteration exceeds u32".into()))?;
                     recorder
                         .record(EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
-                            iteration,
+                            iteration: model_iteration,
                             allow_tools,
                         }))
                         .await?;
@@ -122,7 +139,7 @@ impl AgentLoop {
                     if let Some(reminder) = reminder {
                         recorder
                             .record(EventMsg::SystemReminder(SystemReminderEvent {
-                                iteration,
+                                iteration: model_iteration,
                                 reminder,
                             }))
                             .await?;
@@ -135,12 +152,12 @@ impl AgentLoop {
                         } else {
                             Vec::new()
                         },
-                        iteration,
+                        iteration: model_iteration,
                     };
                     let ctx = HookCtx {
                         thread_id: recorder.thread_id(),
                         turn_id,
-                        iteration: Some(iteration),
+                        iteration: Some(model_iteration),
                         config,
                     };
                     for middleware in &self.middlewares {
@@ -155,12 +172,15 @@ impl AgentLoop {
                     // Final text wins; deltas only fill in when it is missing.
                     let content = response.content.or(streamed.as_ref().map(|s| s.1.clone()));
                     let started = streamed.as_ref().map(|s| s.0);
-                    let (message, effect) = machine.on_model_output(
-                        started.unwrap_or_else(MessageId::new),
-                        content,
-                        response.tool_calls,
-                    )?;
-                    if let Some(message) = message {
+                    let calls = agent.on_model_output(content.as_deref(), &response.tool_calls)?;
+                    validate_tool_calls(&response.tool_calls, &calls, allow_tools)?;
+                    let ignored_tool_calls = response.tool_calls.len() - calls.len();
+                    if content.is_some() || !calls.is_empty() {
+                        let message = AssistantMessageEvent {
+                            message_id: started.unwrap_or_else(MessageId::new),
+                            content,
+                            tool_calls: calls.clone(),
+                        };
                         if started.is_none() {
                             recorder
                                 .record(EventMsg::AssistantMessageStart(
@@ -172,39 +192,34 @@ impl AgentLoop {
                         }
                         recorder.record(EventMsg::AssistantMessage(message)).await?;
                     }
-                    if effect.ignored_tool_calls > 0 {
+                    if ignored_tool_calls > 0 {
                         recorder
                             .record(EventMsg::Warning(WarningEvent {
-                                message: format!(
-                                    "ignored {} tool call(s) requested after the iteration limit",
-                                    effect.ignored_tool_calls
-                                ),
+                                message: format!("ignored {ignored_tool_calls} tool call(s)"),
                             }))
                             .await?;
                     }
 
-                    if let TurnStep::RunTools { calls } = machine.next_step() {
+                    if !calls.is_empty() {
                         let mut results = Vec::with_capacity(calls.len());
                         for call in calls {
                             results.push(
-                                self.run_tool(recorder, call, config, turn_id, iteration)
+                                self.run_tool(recorder, call, config, turn_id, model_iteration)
                                     .await?,
                             );
                         }
-                        machine.on_tool_results(&results)?;
+                        agent.on_tool_results(&results)?;
                     }
 
                     recorder
                         .record(EventMsg::ModelRequestCompleted(
                             ModelRequestCompletedEvent {
-                                iteration,
+                                iteration: model_iteration,
                                 usage: response.usage,
                             },
                         ))
                         .await?;
-                }
-                TurnStep::RunTools { .. } => {
-                    return Err(CoreError::Internal("unexpected pending tool calls".into()));
+                    iteration += 1;
                 }
                 TurnStep::Done {
                     finish,
@@ -342,18 +357,30 @@ impl AgentLoop {
     }
 }
 
-#[async_trait::async_trait]
-impl Agent for AgentLoop {
-    async fn forward(
-        &self,
-        recorder: &mut Recorder,
-        turn_id: TurnId,
-        content: String,
-        name: Option<String>,
-        config: &ThreadConfig,
-    ) -> Result<(), CoreError> {
-        AgentLoop::forward(self, recorder, turn_id, content, name, config).await
+fn validate_tool_calls(
+    requested: &[ToolCall],
+    retained: &[ToolCall],
+    allow_tools: bool,
+) -> Result<(), CoreError> {
+    if !allow_tools && !retained.is_empty() {
+        return Err(CoreError::Internal(
+            "agent retained tool calls when tools were disabled".into(),
+        ));
     }
+
+    let mut next = 0;
+    for call in retained {
+        while next < requested.len() && requested[next] != *call {
+            next += 1;
+        }
+        if next == requested.len() {
+            return Err(CoreError::Internal(
+                "agent tool calls are not an ordered subsequence of model output".into(),
+            ));
+        }
+        next += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +513,79 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    struct ScriptAgent {
+        steps: Vec<TurnStep>,
+        output_calls: VecDeque<Vec<ToolCall>>,
+        step: usize,
+        results: Option<Arc<Mutex<Vec<Vec<ToolResult>>>>>,
+    }
+
+    impl ScriptAgent {
+        fn new(
+            steps: Vec<TurnStep>,
+            output_calls: Vec<Vec<ToolCall>>,
+            results: Option<Arc<Mutex<Vec<Vec<ToolResult>>>>>,
+        ) -> Self {
+            Self {
+                steps,
+                output_calls: output_calls.into(),
+                step: 0,
+                results,
+            }
+        }
+    }
+
+    impl Agent for ScriptAgent {
+        fn next_step(&self) -> TurnStep {
+            self.steps
+                .get(self.step)
+                .cloned()
+                .unwrap_or(TurnStep::Done {
+                    finish: FinishReason::Completed,
+                    last_agent_message: None,
+                })
+        }
+
+        fn on_model_output(
+            &mut self,
+            _content: Option<&str>,
+            _tool_calls: &[ToolCall],
+        ) -> Result<Vec<ToolCall>, CoreError> {
+            self.step += 1;
+            Ok(self.output_calls.pop_front().unwrap_or_default())
+        }
+
+        fn on_tool_results(&mut self, results: &[ToolResult]) -> Result<(), CoreError> {
+            if let Some(capture) = &self.results {
+                capture.lock().unwrap().push(results.to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    struct InfiniteAgent;
+
+    impl Agent for InfiniteAgent {
+        fn next_step(&self) -> TurnStep {
+            TurnStep::CallModel {
+                allow_tools: true,
+                reminder: None,
+            }
+        }
+
+        fn on_model_output(
+            &mut self,
+            _content: Option<&str>,
+            _tool_calls: &[ToolCall],
+        ) -> Result<Vec<ToolCall>, CoreError> {
+            Ok(Vec::new())
+        }
+
+        fn on_tool_results(&mut self, _results: &[ToolResult]) -> Result<(), CoreError> {
+            unreachable!("this policy never retains tools")
+        }
     }
 
     struct FailingTool;
@@ -1535,7 +1635,7 @@ mod tests {
     #[tokio::test]
     async fn after_model_rewrites_message_history_and_completion() {
         let model = ScriptedModel::new(vec![resp(Some("hello"), vec![])]);
-        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
         let trace = Arc::new(Mutex::new(Vec::new()));
         let mut probe = Probe::new("uppercase", trace);
         probe.uppercase_response = true;
@@ -1830,5 +1930,306 @@ mod tests {
             .unwrap();
         assert_eq!(total, usage(30, 5, 12, 1));
         assert_eq!(total.total_tokens(), 48);
+    }
+
+    #[tokio::test]
+    async fn policy_output_must_be_an_ordered_subsequence_and_tools_must_be_allowed() {
+        let first = tc("echo", serde_json::json!({"input":"first"}));
+        let second = tc("echo", serde_json::json!({"input":"second"}));
+        let forged = tc("echo", serde_json::json!({"input":"forged"}));
+        let cases = [
+            (
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+                true,
+            ),
+            (vec![first.clone()], vec![forged], true),
+            (vec![first.clone()], vec![first.clone()], false),
+        ];
+
+        for (requested, retained, allow_tools) in cases {
+            let model = ScriptedModel::new(vec![resp(None, requested)]);
+            let mut h = Harness::without_time(model, &ThreadConfig::default());
+            h.agent = h.agent.with_agent_factory(move |_| {
+                Box::new(ScriptAgent::new(
+                    vec![
+                        TurnStep::CallModel {
+                            allow_tools,
+                            reminder: None,
+                        },
+                        TurnStep::Done {
+                            finish: FinishReason::Completed,
+                            last_agent_message: None,
+                        },
+                    ],
+                    vec![retained.clone()],
+                    None,
+                ))
+            });
+
+            let (result, events, _) = h.turn("go").await;
+            assert!(matches!(result, Err(CoreError::Internal(_))));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::ToolCallBegin(_))));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::AssistantMessage(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_cannot_request_more_than_max_tool_iterations_plus_one_calls() {
+        let max_tool_iterations = 2;
+        let model = ScriptedModel::new(
+            (0..=max_tool_iterations)
+                .map(|_| resp(Some("again"), vec![]))
+                .collect(),
+        );
+        let mut h = Harness::without_time(
+            model.clone(),
+            &ThreadConfig {
+                max_tool_iterations,
+                ..Default::default()
+            },
+        );
+        h.agent = h.agent.with_agent_factory(|_| Box::new(InfiniteAgent));
+
+        let (result, events, _) = h.turn("go").await;
+        assert!(matches!(result, Err(CoreError::Internal(_))));
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            (max_tool_iterations + 1) as usize
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::ModelRequestStarted(_)))
+                .count(),
+            (max_tool_iterations + 1) as usize
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn custom_policy_can_continue_after_text_and_choose_finish_reason() {
+        let model = ScriptedModel::new(vec![
+            resp(Some("thinking"), vec![]),
+            resp(Some("answer"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        h.agent = h.agent.with_agent_factory(|_| {
+            Box::new(ScriptAgent::new(
+                vec![
+                    TurnStep::CallModel {
+                        allow_tools: true,
+                        reminder: None,
+                    },
+                    TurnStep::CallModel {
+                        allow_tools: false,
+                        reminder: Some(SystemReminder::ToolLimitReached),
+                    },
+                    TurnStep::Done {
+                        finish: FinishReason::ExceedMaxIters,
+                        last_agent_message: Some("policy finished".into()),
+                    },
+                ],
+                vec![vec![], vec![]],
+                None,
+            ))
+        });
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert_eq!(
+            kinds(&events),
+            [
+                "turn_started",
+                "user",
+                "req_start:0",
+                "start",
+                "assistant:0",
+                "req_done:0",
+                "req_start:1",
+                "reminder",
+                "start",
+                "assistant:0",
+                "req_done:1",
+                "token_count",
+                "turn_complete"
+            ]
+        );
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(event)
+                if event.finish_reason == FinishReason::ExceedMaxIters
+                    && event.last_agent_message.as_deref() == Some("policy finished")
+        ));
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_policy_keeps_second_call_warns_and_receives_paired_results() {
+        let first = tc("echo", serde_json::json!({"input":"first"}));
+        let second = tc("echo", serde_json::json!({"input":"second"}));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![first.clone(), second.clone()]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let captured = results.clone();
+        let expected_second = second.clone();
+        h.agent = h.agent.with_agent_factory(move |_| {
+            Box::new(ScriptAgent::new(
+                vec![
+                    TurnStep::CallModel {
+                        allow_tools: true,
+                        reminder: None,
+                    },
+                    TurnStep::CallModel {
+                        allow_tools: true,
+                        reminder: None,
+                    },
+                    TurnStep::Done {
+                        finish: FinishReason::Completed,
+                        last_agent_message: Some("done".into()),
+                    },
+                ],
+                vec![vec![second.clone()], vec![]],
+                Some(captured.clone()),
+            ))
+        });
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert_eq!(
+            kinds(&events),
+            [
+                "turn_started",
+                "user",
+                "req_start:0",
+                "start",
+                "assistant:1",
+                "warning",
+                "tool_begin",
+                "tool_end:Completed",
+                "req_done:0",
+                "req_start:1",
+                "start",
+                "assistant:0",
+                "req_done:1",
+                "token_count",
+                "turn_complete"
+            ]
+        );
+        let warning = events.iter().find_map(|event| match &event.msg {
+            EventMsg::Warning(warning) => Some(&warning.message),
+            _ => None,
+        });
+        assert!(warning.is_some_and(|message| message.contains("1")));
+        let assistant = events.iter().find_map(|event| match &event.msg {
+            EventMsg::AssistantMessage(message) => Some(message),
+            _ => None,
+        });
+        let assistant_calls = &assistant.unwrap().tool_calls;
+        assert_eq!(assistant_calls.len(), 1);
+        assert_eq!(assistant_calls[0], expected_second);
+        let paired_results = results.lock().unwrap();
+        assert_eq!(paired_results.len(), 1);
+        assert_eq!(paired_results[0].len(), 1);
+        assert_eq!(paired_results[0][0].call_id, expected_second.id);
+        assert_eq!(paired_results[0][0].tool_name, expected_second.name);
+    }
+
+    #[tokio::test]
+    async fn policy_receives_tool_results_in_call_order_with_matching_ids() {
+        let calls = vec![
+            tc("echo", serde_json::json!({"input":"first"})),
+            tc("echo", serde_json::json!({"input":"second"})),
+            tc("echo", serde_json::json!({"input":"third"})),
+        ];
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let model = ScriptedModel::new(vec![resp(None, calls.clone())]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let captured = results.clone();
+        let expected_calls = calls.clone();
+        h.agent = h.agent.with_agent_factory(move |_| {
+            Box::new(ScriptAgent::new(
+                vec![
+                    TurnStep::CallModel {
+                        allow_tools: true,
+                        reminder: None,
+                    },
+                    TurnStep::Done {
+                        finish: FinishReason::Completed,
+                        last_agent_message: None,
+                    },
+                ],
+                vec![calls.clone()],
+                Some(captured.clone()),
+            ))
+        });
+
+        h.turn("go").await.0.unwrap();
+        let received = results.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0]
+                .iter()
+                .map(|result| result.call_id.clone())
+                .collect::<Vec<_>>(),
+            expected_calls
+                .iter()
+                .map(|call| call.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            received[0]
+                .iter()
+                .map(|result| result.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            expected_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_creates_a_fresh_policy_for_every_turn() {
+        let model = ScriptedModel::new(vec![resp(Some("one"), vec![]), resp(Some("two"), vec![])]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let created = Arc::new(AtomicUsize::new(0));
+        let factory_created = created.clone();
+        h.agent = h.agent.with_agent_factory(move |_| {
+            factory_created.fetch_add(1, Ordering::SeqCst);
+            Box::new(ScriptAgent::new(
+                vec![
+                    TurnStep::CallModel {
+                        allow_tools: true,
+                        reminder: None,
+                    },
+                    TurnStep::Done {
+                        finish: FinishReason::Completed,
+                        last_agent_message: Some("fresh".into()),
+                    },
+                ],
+                vec![vec![]],
+                None,
+            ))
+        });
+
+        assert!(h.turn("first").await.0.is_ok());
+        assert!(h.turn("second").await.0.is_ok());
+        assert_eq!(created.load(Ordering::SeqCst), 2);
     }
 }

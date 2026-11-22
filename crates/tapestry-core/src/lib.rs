@@ -15,12 +15,9 @@ pub mod recorder;
 pub mod store;
 pub mod thread;
 pub mod tool;
-pub mod turn;
 
-pub mod genai;
-
-pub use agent::Agent;
 pub use agent::AgentLoop;
+pub use agent::{Agent, AgentFactory, ReactAgent, TurnStep};
 pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
 pub use config::ThreadConfig;
 pub use error::CoreError;
@@ -40,7 +37,7 @@ pub use tapestry_protocol::{
     ToolCallId, ToolResult, ToolSpec,
 };
 
-pub use genai::{
+pub use model::genai::{
     default_api_key_env, parse_model_name, GenaiChatService, GenaiModelClient, GenaiProviderConfig,
 };
 pub use model::{OpenAiChatModel, OpenAiResponseModel};
@@ -48,12 +45,9 @@ pub use recorder::Recorder;
 pub use store::{EventStore, EventSubscription, InMemoryEventStore, NewEvent, SubscriptionSource};
 pub use thread::{TapestryThread, ThreadBuilder, ThreadHandle};
 pub use tool::{EchoTool, Tool, ToolRegistry};
-pub use turn::{ModelOutputEffect, TurnMachine, TurnStep};
 
 #[cfg(test)]
 mod compatibility_tests {
-    use std::sync::Arc;
-
     #[test]
     fn grouped_model_paths_match_crate_root_exports() {
         use crate::model::{chat_model, response_model};
@@ -78,20 +72,12 @@ mod compatibility_tests {
     }
 
     #[test]
-    fn legacy_genai_path_remains_available() {
-        fn assert_type<T>() {}
-        assert_type::<crate::genai::GenaiProviderConfig>();
-        assert_type::<crate::genai::GenaiModelClient>();
-    }
-
-    #[test]
-    fn agent_loop_matches_the_agent_trait() {
-        let agent = crate::AgentLoop::new(
-            Arc::new(crate::MockModelClient),
-            Arc::new(crate::ToolRegistry::new()),
-        );
+    fn react_agent_matches_the_agent_trait() {
+        let agent = crate::ReactAgent::new(3);
         let _: &dyn crate::Agent = &agent;
         let _: &dyn crate::agent::agent_trait::Agent = &agent;
+        fn assert_factory(_: crate::AgentFactory) {}
+        let _ = assert_factory;
     }
 
     #[test]
