@@ -277,6 +277,7 @@ async fn process_submission(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -288,6 +289,7 @@ mod tests {
     use crate::clock::FixedClock;
     use crate::formatter::prompt::render_system_reminder;
     use crate::formatter::{Formatter, OpenAiFormatter};
+    use crate::middleware::{HookCtx, Middleware, ToolDecision};
     use crate::model::MockModelClient;
     use crate::store::testing::FlakyStore;
     use crate::store::NewEvent;
@@ -425,6 +427,34 @@ mod tests {
     impl ModelClient for FailingModel {
         async fn complete(&self, _: ModelRequest) -> Result<ModelResponse, CoreError> {
             Err(CoreError::Model("down".into()))
+        }
+    }
+
+    struct ThreadMiddleware {
+        tool_calls: Arc<AtomicUsize>,
+        fail_before_model: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for ThreadMiddleware {
+        async fn before_model(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _request: &mut ModelRequest,
+        ) -> Result<(), CoreError> {
+            if self.fail_before_model {
+                return Err(CoreError::Tool("middleware failure".into()));
+            }
+            Ok(())
+        }
+
+        async fn before_tool(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _call: &mut tapestry_protocol::ToolCall,
+        ) -> Result<ToolDecision, CoreError> {
+            self.tool_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolDecision::Continue)
         }
     }
 
@@ -608,6 +638,79 @@ mod tests {
         assert!(matches!(error.msg, EventMsg::Error(_)));
         assert!(error.turn_id.is_some());
         assert_eq!(error.turn_id, started.turn_id);
+    }
+
+    #[tokio::test]
+    async fn injected_middleware_errors_are_recorded_for_the_submission() {
+        let model: Arc<dyn ModelClient> = Arc::new(MockModelClient);
+        let agent = AgentLoop::new(model.clone(), test_tools()).with_middleware(Arc::new(
+            ThreadMiddleware {
+                tool_calls: Arc::new(AtomicUsize::new(0)),
+                fail_before_model: true,
+            },
+        ));
+        let (_thread, handle) = TapestryThread::builder(model, test_tools())
+            .agent(Arc::new(agent))
+            .spawn();
+        let mut client = Client::new(handle.clone()).await;
+        client.configure_without_time_context().await;
+        let submission = handle
+            .submit(Command::StartTurn {
+                content: "hello".into(),
+                name: None,
+                turn_id: None,
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.events.collect_events_for(submission),
+        )
+        .await
+        .expect("no terminal event")
+        .unwrap();
+
+        let error = events
+            .iter()
+            .find(|event| matches!(event.msg, EventMsg::Error(_)))
+            .unwrap();
+        assert_eq!(error.id, submission);
+        assert!(error.turn_id.is_some());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn middleware_state_persists_across_turns_without_extra_events() {
+        let model: Arc<dyn ModelClient> = Arc::new(RecordingModel::default());
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let agent = AgentLoop::new(model.clone(), test_tools()).with_middleware(Arc::new(
+            ThreadMiddleware {
+                tool_calls: tool_calls.clone(),
+                fail_before_model: false,
+            },
+        ));
+        let (_thread, handle) = TapestryThread::builder(model, test_tools())
+            .agent(Arc::new(agent))
+            .spawn();
+        let mut client = Client::new(handle).await;
+        client.configure_without_time_context().await;
+
+        let first = client.turn("tool:echo", None).await;
+        let second = client.turn("tool:echo", None).await;
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        for events in [first, second] {
+            assert_eq!(events.len(), 14);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::Error(_))));
+            assert!(matches!(
+                events.last().unwrap().msg,
+                EventMsg::TurnComplete(_)
+            ));
+        }
     }
 
     #[tokio::test]

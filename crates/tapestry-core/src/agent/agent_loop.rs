@@ -13,6 +13,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::context::next_context_entry;
 use crate::error::CoreError;
+use crate::middleware::{HookCtx, Middleware, ToolDecision};
 use crate::model::ModelClient;
 use crate::recorder::Recorder;
 use crate::tool::ToolRegistry;
@@ -26,6 +27,7 @@ pub struct AgentLoop {
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
     clock: Arc<dyn Clock>,
+    middlewares: Vec<Arc<dyn Middleware>>,
 }
 
 impl AgentLoop {
@@ -42,7 +44,21 @@ impl AgentLoop {
             model,
             tools,
             clock,
+            middlewares: Vec::new(),
         }
+    }
+
+    pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
+        self.middlewares.push(middleware);
+        self
+    }
+
+    pub fn with_middlewares(
+        mut self,
+        middlewares: impl IntoIterator<Item = Arc<dyn Middleware>>,
+    ) -> Self {
+        self.middlewares.extend(middlewares);
+        self
     }
 
     /// Run one turn, recording its events (and so its history) through
@@ -62,6 +78,15 @@ impl AgentLoop {
         recorder
             .record(EventMsg::TurnStarted(TurnStartedEvent {}))
             .await?;
+        let turn_ctx = HookCtx {
+            thread_id: recorder.thread_id(),
+            turn_id,
+            iteration: None,
+            config,
+        };
+        for middleware in &self.middlewares {
+            middleware.before_turn(&turn_ctx).await?;
+        }
         if let Some(context) = next_context_entry(
             recorder.history(),
             config.include_time_context,
@@ -102,7 +127,7 @@ impl AgentLoop {
                             }))
                             .await?;
                     }
-                    let request = ModelRequest {
+                    let mut request = ModelRequest {
                         system_prompt: config.effective_system_prompt(),
                         events: recorder.events().await?,
                         tools: if allow_tools {
@@ -112,7 +137,19 @@ impl AgentLoop {
                         },
                         iteration,
                     };
-                    let (response, streamed) = self.stream_model(recorder, request).await?;
+                    let ctx = HookCtx {
+                        thread_id: recorder.thread_id(),
+                        turn_id,
+                        iteration: Some(iteration),
+                        config,
+                    };
+                    for middleware in &self.middlewares {
+                        middleware.before_model(&ctx, &mut request).await?;
+                    }
+                    let (mut response, streamed) = self.stream_model(recorder, request).await?;
+                    for middleware in self.middlewares.iter().rev() {
+                        middleware.after_model(&ctx, &mut response).await?;
+                    }
                     total += response.usage;
 
                     // Final text wins; deltas only fill in when it is missing.
@@ -149,7 +186,10 @@ impl AgentLoop {
                     if let TurnStep::RunTools { calls } = machine.next_step() {
                         let mut results = Vec::with_capacity(calls.len());
                         for call in calls {
-                            results.push(self.run_tool(recorder, call).await?);
+                            results.push(
+                                self.run_tool(recorder, call, config, turn_id, iteration)
+                                    .await?,
+                            );
                         }
                         machine.on_tool_results(&results)?;
                     }
@@ -173,6 +213,9 @@ impl AgentLoop {
             }
         };
 
+        for middleware in self.middlewares.iter().rev() {
+            middleware.after_turn(&turn_ctx).await?;
+        }
         recorder
             .record(EventMsg::TokenCount(TokenCountEvent { usage: total }))
             .await?;
@@ -237,8 +280,28 @@ impl AgentLoop {
     async fn run_tool(
         &self,
         recorder: &mut Recorder,
-        call: ToolCall,
+        mut call: ToolCall,
+        config: &ThreadConfig,
+        turn_id: TurnId,
+        iteration: u32,
     ) -> Result<ToolResult, CoreError> {
+        let original_id = call.id.clone();
+        let original_name = call.name.clone();
+        let ctx = HookCtx {
+            thread_id: recorder.thread_id(),
+            turn_id,
+            iteration: Some(iteration),
+            config,
+        };
+        let mut decision = ToolDecision::Continue;
+        for middleware in &self.middlewares {
+            decision = middleware.before_tool(&ctx, &mut call).await?;
+            if matches!(&decision, ToolDecision::Skip(_)) {
+                break;
+            }
+        }
+        call.id = original_id;
+        call.name = original_name;
         recorder
             .record(EventMsg::ToolCallBegin(ToolCallBeginEvent {
                 tool_call_id: call.id.clone(),
@@ -248,17 +311,25 @@ impl AgentLoop {
             .await?;
 
         let started = Instant::now();
-        let result = match self.tools.get(&call.name) {
-            Some(tool) => {
-                let mut result = tool.execute(&call).await;
-                // The call is authoritative; a tool must not re-key its result.
-                result.call_id = call.id.clone();
-                result.tool_name = call.name.clone();
-                result
-            }
-            None => ToolResult::not_found(&call),
+        let skipped = matches!(&decision, ToolDecision::Skip(_));
+        let mut result = match decision {
+            ToolDecision::Skip(result) => result,
+            ToolDecision::Continue => match self.tools.get(&call.name) {
+                Some(tool) => tool.execute(&call).await,
+                None => ToolResult::not_found(&call),
+            },
         };
-        let duration_ms = started.elapsed().as_millis() as u64;
+        for middleware in self.middlewares.iter().rev() {
+            middleware.after_tool(&ctx, &call, &mut result).await?;
+        }
+        // The call is authoritative; middleware and tools cannot re-key results.
+        result.call_id = call.id.clone();
+        result.tool_name = call.name.clone();
+        let duration_ms = if skipped {
+            0
+        } else {
+            started.elapsed().as_millis() as u64
+        };
 
         recorder
             .record(EventMsg::ToolCallEnd(ToolCallEndEvent {
@@ -288,6 +359,7 @@ impl Agent for AgentLoop {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -460,12 +532,175 @@ mod tests {
         }
     }
 
+    struct CountingEchoTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingEchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn spec(&self) -> ToolSpec {
+            EchoTool.spec()
+        }
+
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            EchoTool.execute(call).await
+        }
+    }
+
     fn registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         registry.register(Arc::new(FailingTool));
         registry.register(Arc::new(MisKeyedTool));
         Arc::new(registry)
+    }
+
+    struct Probe {
+        label: &'static str,
+        trace: Arc<Mutex<Vec<String>>>,
+        prompt_suffix: Option<&'static str>,
+        uppercase_response: bool,
+        tool_input: Option<&'static str>,
+        append_tool_input: Option<&'static str>,
+        skip_output: Option<&'static str>,
+        rekey_call: bool,
+        after_output: Option<&'static str>,
+        rekey_result: bool,
+        fail_before_model: bool,
+        tool_count: Option<Arc<AtomicUsize>>,
+        event_store: Option<Arc<dyn EventStore>>,
+        turn_complete_seen: Option<Arc<AtomicBool>>,
+    }
+
+    impl Probe {
+        fn new(label: &'static str, trace: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                label,
+                trace,
+                prompt_suffix: None,
+                uppercase_response: false,
+                tool_input: None,
+                append_tool_input: None,
+                skip_output: None,
+                rekey_call: false,
+                after_output: None,
+                rekey_result: false,
+                fail_before_model: false,
+                tool_count: None,
+                event_store: None,
+                turn_complete_seen: None,
+            }
+        }
+
+        fn record(&self, hook: &str) {
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("{}.{}", self.label, hook));
+        }
+    }
+
+    #[async_trait]
+    impl Middleware for Probe {
+        async fn before_turn(&self, _ctx: &HookCtx<'_>) -> Result<(), CoreError> {
+            self.record("before_turn");
+            Ok(())
+        }
+
+        async fn after_turn(&self, ctx: &HookCtx<'_>) -> Result<(), CoreError> {
+            self.record("after_turn");
+            if let (Some(store), Some(seen)) = (&self.event_store, &self.turn_complete_seen) {
+                let events = store.read_after(ctx.thread_id, 0).await?;
+                seen.store(
+                    events.iter().any(|event| {
+                        matches!(
+                            event.msg,
+                            EventMsg::TokenCount(_) | EventMsg::TurnComplete(_)
+                        )
+                    }),
+                    Ordering::SeqCst,
+                );
+            }
+            Ok(())
+        }
+
+        async fn before_model(
+            &self,
+            _ctx: &HookCtx<'_>,
+            request: &mut ModelRequest,
+        ) -> Result<(), CoreError> {
+            self.record("before_model");
+            if self.fail_before_model {
+                return Err(CoreError::Tool("middleware before_model failed".into()));
+            }
+            if let Some(suffix) = self.prompt_suffix {
+                request
+                    .system_prompt
+                    .get_or_insert_with(String::new)
+                    .push_str(suffix);
+            }
+            Ok(())
+        }
+
+        async fn after_model(
+            &self,
+            _ctx: &HookCtx<'_>,
+            response: &mut ModelResponse,
+        ) -> Result<(), CoreError> {
+            self.record("after_model");
+            if self.uppercase_response {
+                if let Some(content) = &mut response.content {
+                    content.make_ascii_uppercase();
+                }
+            }
+            Ok(())
+        }
+
+        async fn before_tool(
+            &self,
+            _ctx: &HookCtx<'_>,
+            call: &mut ToolCall,
+        ) -> Result<ToolDecision, CoreError> {
+            self.record("before_tool");
+            if let Some(count) = &self.tool_count {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(input) = self.tool_input {
+                call.arguments["input"] = serde_json::json!(input);
+            }
+            if let Some(suffix) = self.append_tool_input {
+                let input = call.arguments["input"].as_str().unwrap_or_default();
+                call.arguments["input"] = serde_json::json!(format!("{input}{suffix}"));
+            }
+            if self.rekey_call {
+                call.id = ToolCallId::from("middleware-id");
+                call.name = "middleware-tool".into();
+            }
+            if let Some(output) = self.skip_output {
+                return Ok(ToolDecision::Skip(ToolResult::completed(call, output)));
+            }
+            Ok(ToolDecision::Continue)
+        }
+
+        async fn after_tool(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _call: &ToolCall,
+            result: &mut ToolResult,
+        ) -> Result<(), CoreError> {
+            self.record("after_tool");
+            if let Some(output) = self.after_output {
+                result.output = output.into();
+            }
+            if self.rekey_result {
+                result.call_id = ToolCallId::from("middleware-result-id");
+                result.tool_name = "middleware-result-tool".into();
+            }
+            Ok(())
+        }
     }
 
     struct Harness {
@@ -1246,6 +1481,314 @@ mod tests {
             HistoryItem::ToolResult(r) if r.call_id == call.id && r.tool_name == "miskeyed"
         )));
         assert_eq!(kinds(&events).last().unwrap(), "turn_complete");
+    }
+
+    #[tokio::test]
+    async fn turn_hooks_bracket_other_hooks_and_precede_turn_complete() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let turn_complete_seen = Arc::new(AtomicBool::new(false));
+        let mut h = Harness::without_time(Arc::new(MockModelClient), &ThreadConfig::default());
+        let mut probe = Probe::new("one", trace.clone());
+        probe.event_store = Some(h.store.clone());
+        probe.turn_complete_seen = Some(turn_complete_seen.clone());
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        h.turn("please tool:echo now").await.0.unwrap();
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                "one.before_turn",
+                "one.before_model",
+                "one.after_model",
+                "one.before_tool",
+                "one.after_tool",
+                "one.before_model",
+                "one.after_model",
+                "one.after_turn"
+            ]
+        );
+        assert!(!turn_complete_seen.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn before_model_rewrites_request_without_emitting_events() {
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("prompt", trace);
+        probe.prompt_suffix = Some(" appended");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        assert_eq!(
+            model.requests.lock().unwrap()[0].system_prompt.as_deref(),
+            Some(" appended")
+        );
+        let baseline = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let (_, baseline_events, _) = run(baseline, "go", &ThreadConfig::default()).await;
+        assert_eq!(kinds(&events), kinds(&baseline_events));
+    }
+
+    #[tokio::test]
+    async fn after_model_rewrites_message_history_and_completion() {
+        let model = ScriptedModel::new(vec![resp(Some("hello"), vec![])]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("uppercase", trace);
+        probe.uppercase_response = true;
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::AssistantMessage(message) if message.content.as_deref() == Some("HELLO")
+        )));
+        assert_eq!(
+            h.history().last(),
+            Some(&HistoryItem::assistant(Some("HELLO".into()), Vec::new()))
+        );
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.last_agent_message.as_deref() == Some("HELLO")
+        ));
+    }
+
+    #[tokio::test]
+    async fn before_tool_rewrites_arguments_but_not_call_identity() {
+        let call = tc("echo", serde_json::json!({"input":"original"}));
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![call.clone()]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("rewrite", trace);
+        probe.tool_input = Some("patched");
+        probe.rekey_call = true;
+        probe.rekey_result = true;
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        let begin = events
+            .iter()
+            .find_map(|event| match &event.msg {
+                EventMsg::ToolCallBegin(begin) => Some(begin),
+                _ => None,
+            })
+            .unwrap();
+        let end = events
+            .iter()
+            .find_map(|event| match &event.msg {
+                EventMsg::ToolCallEnd(end) => Some(end),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(begin.tool_call_id, call.id);
+        assert_eq!(begin.tool_name, "echo");
+        assert_eq!(begin.arguments["input"], "patched");
+        assert_eq!(end.result.call_id, call.id);
+        assert_eq!(end.result.tool_name, "echo");
+        assert_eq!(end.result.output, "patched");
+    }
+
+    #[tokio::test]
+    async fn after_tool_rewrites_result_in_next_model_history() {
+        let model = ScriptedModel::new(vec![
+            resp(
+                None,
+                vec![tc("echo", serde_json::json!({"input":"original"}))],
+            ),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("result", trace);
+        probe.after_output = Some("rewritten");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::ToolCallEnd(end) if end.result.output == "rewritten"
+        )));
+        assert!(request_history(&model.requests.lock().unwrap()[1])
+            .iter()
+            .any(|item| matches!(item, HistoryItem::ToolResult(result) if result.output == "rewritten")));
+    }
+
+    #[tokio::test]
+    async fn skipped_tool_stops_before_hooks_but_runs_all_after_hooks() {
+        let call = tc("echo", serde_json::json!({"input":"original"}));
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![call.clone()]),
+            resp(Some("done"), vec![]),
+        ]);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CountingEchoTool(executions.clone())));
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut first = Probe::new("first", trace.clone());
+        first.skip_output = Some("skipped");
+        first.rekey_result = true;
+        let second = Probe::new("second", trace.clone());
+        h.agent = AgentLoop::new(model, Arc::new(tools))
+            .with_middlewares([Arc::new(first) as Arc<dyn Middleware>, Arc::new(second)]);
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        let trace = trace.lock().unwrap();
+        assert!(!trace.iter().any(|entry| entry == "second.before_tool"));
+        assert!(trace.iter().any(|entry| entry == "second.after_tool"));
+        let begin_count = events
+            .iter()
+            .filter(|event| matches!(event.msg, EventMsg::ToolCallBegin(_)))
+            .count();
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::ToolCallEnd(end) => Some(&end.result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begin_count, ends.len());
+        assert_eq!(ends[0].output, "skipped");
+        assert_eq!(ends[0].status, ToolCallStatus::Completed);
+        assert_eq!(ends[0].call_id, call.id);
+        assert_eq!(ends[0].tool_name, "echo");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_still_runs_after_tool_hooks() {
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![tc("missing", serde_json::Value::Null)]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        h.agent = h
+            .agent
+            .with_middleware(Arc::new(Probe::new("probe", trace.clone())));
+
+        h.turn("go").await.0.unwrap();
+
+        assert!(trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "probe.after_tool"));
+    }
+
+    #[tokio::test]
+    async fn multiple_middlewares_apply_in_order_and_unwind_in_reverse() {
+        let model = ScriptedModel::new(vec![
+            resp(
+                None,
+                vec![tc("echo", serde_json::json!({"input":"original"}))],
+            ),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut first = Probe::new("A", trace.clone());
+        first.tool_input = Some("a");
+        let mut second = Probe::new("B", trace.clone());
+        second.append_tool_input = Some("b");
+        h.agent = h
+            .agent
+            .with_middlewares([Arc::new(first) as Arc<dyn Middleware>, Arc::new(second)]);
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        let trace = trace.lock().unwrap();
+        let calls_for = |node: &str| {
+            trace
+                .iter()
+                .filter(|entry| entry.ends_with(node))
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|entry| entry.ends_with("before_turn"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["A.before_turn", "B.before_turn"]
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|entry| entry.ends_with("after_turn"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["B.after_turn", "A.after_turn"]
+        );
+        assert_eq!(calls_for("before_tool"), ["A.before_tool", "B.before_tool"]);
+        assert_eq!(
+            calls_for("before_model"),
+            [
+                "A.before_model",
+                "B.before_model",
+                "A.before_model",
+                "B.before_model"
+            ]
+        );
+        for node in ["after_model", "after_tool"] {
+            let calls = calls_for(node);
+            if node == "after_model" {
+                assert_eq!(
+                    calls,
+                    [
+                        format!("B.{node}"),
+                        format!("A.{node}"),
+                        format!("B.{node}"),
+                        format!("A.{node}")
+                    ]
+                );
+            } else {
+                assert_eq!(calls, [format!("B.{node}"), format!("A.{node}")]);
+            }
+        }
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::ToolCallEnd(end) if end.result.output == "ab"
+        )));
+    }
+
+    #[tokio::test]
+    async fn before_model_error_stops_turn_without_after_turn_or_model_call() {
+        let model = ScriptedModel::new(vec![resp(Some("unreachable"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("failure", trace.clone());
+        probe.fail_before_model = true;
+        let next = Probe::new("next", trace.clone());
+        h.agent = h
+            .agent
+            .with_middlewares([Arc::new(probe) as Arc<dyn Middleware>, Arc::new(next)]);
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(matches!(result, Err(CoreError::Tool(_))));
+        assert!(model.requests.lock().unwrap().is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+        assert!(!trace.lock().unwrap().iter().any(|entry| {
+            entry == "failure.after_turn"
+                || entry == "next.before_model"
+                || entry == "next.after_turn"
+        }));
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod formatter;
+pub mod middleware;
 pub mod model;
 pub mod projection;
 pub mod recorder;
@@ -28,6 +29,7 @@ pub use formatter::prompt::{
 };
 pub use formatter::Formatter;
 pub use formatter::OpenAiFormatter;
+pub use middleware::{HookCtx, Middleware, ToolDecision};
 pub use model::{
     ChatModel, MockChatModel, MockModelClient, MockResponseModel, ModelClient, ModelStream,
     ModelStreamSource, ResponseModel,
@@ -90,5 +92,15 @@ mod compatibility_tests {
         );
         let _: &dyn crate::Agent = &agent;
         let _: &dyn crate::agent::agent_trait::Agent = &agent;
+    }
+
+    #[test]
+    fn middleware_types_are_exported_at_crate_root() {
+        fn assert_middleware(_: &dyn crate::Middleware) {}
+        let _ = assert_middleware;
+        fn assert_context(_: Option<&crate::HookCtx<'_>>) {}
+        let _ = assert_context;
+        fn assert_decision(_: crate::ToolDecision) {}
+        let _ = assert_decision;
     }
 }

@@ -137,6 +137,37 @@ adapter -> event
 
 `TurnMachine` is synchronous and performs no IO. It exposes `next_step()` (`CallModel`, `RunTools`, `Done`) and is advanced by `on_model_output` (which returns the `AssistantMessage` to record) / `on_tool_results`. It holds no history. `AgentLoop::run_turn` is the async driver: it performs the step, times tools, and records every event through the `Recorder`; before each model call it reads a fresh immutable event snapshot. `RunTools` is a batch so parallel execution can be added later.
 
+### Middleware hooks
+
+`AgentLoop` accepts zero or more `Arc<dyn Middleware>` values through
+`with_middleware` / `with_middlewares`; the existing constructors default to
+none. `HookCtx` provides the thread id, turn id, optional model/tool iteration,
+and read-only thread configuration. Middleware cannot access the `Recorder`,
+and hook execution itself never adds events.
+
+Before hooks run in registration order; after hooks unwind in reverse order:
+
+- `before_turn` runs after `TurnStarted`, before environment context and user
+  message recording. `after_turn` runs after the model/tool loop, before
+  `TokenCount` and `TurnComplete`.
+- `before_model` runs after the request snapshot is assembled and before
+  `ModelClient::stream`; `after_model` runs after the final response and before
+  assistant output is passed to the turn machine. Rewritten final content,
+  tool calls, and usage drive subsequent events/history; already-recorded text
+  deltas are unchanged.
+- `before_tool` runs before `ToolCallBegin`. It may rewrite arguments or return
+  `ToolDecision::Skip(result)` to bypass execution and later before-tool hooks.
+  The original call id and name are restored before recording/execution.
+  `after_tool` runs before `ToolCallEnd`, including for skipped and unknown
+  tools; result id and name are restored from the original call afterward.
+- Any hook error stops the turn and propagates to the thread worker, which
+  records the submission-scoped `Error`. `after_turn` is not called after a
+  prior hook or runtime error.
+
+Middleware-owned state is retained by the middleware instance (for example
+through atomics or a mutex), is not stored in the event log, and is not restored
+when resuming a thread.
+
 ### Streaming model output
 
 `AgentLoop` always calls `ChatModel::stream`, which returns a `ModelStream` of `ModelStreamItem`s: zero or more `TextDelta { text }`, then exactly one `Completed { response }` carrying the full text, tool calls and usage. The default `stream` wraps `complete`, so non-streaming clients need no changes. Both mocks stream text word by word; `model::genai::GenaiModelClient` uses genai's `exec_chat_stream` with content, tool-call and usage capture (text chunks become deltas, the end event becomes `Completed`; a stream ending without it is a model error).
@@ -228,7 +259,7 @@ sequenceDiagram
 - The genai mapping drops provider metadata such as Gemini `thought_signatures`, which may break multi-call tool use with thinking models; the model protocol needs a provider-metadata field.
 - Turns are serial: `Interrupt` is queued and only handled after the running turn ends; in-turn cancellation is a later phase.
 - Only an in-memory event store ships; history is unbounded (no compaction).
-- Not yet: tool-argument and reasoning deltas, parallel tools, hooks, approvals, multi-agent messaging.
+- Not yet: tool-argument and reasoning deltas, parallel tools, approvals, multi-agent messaging.
 
 ## v1 protocol surface
 
