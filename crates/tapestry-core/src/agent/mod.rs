@@ -6,7 +6,7 @@ pub mod react_agent;
 
 pub use agent_loop::AgentLoop;
 pub use agent_trait::{
-    Agent, AgentBindings, AgentFactory, ReasoningOutput, StepOutput, StreamedMessage, TurnContext,
+    Agent, AgentDeps, AgentFactory, ReasoningOutput, StepOutput, StreamedMessage, TurnContext,
     TurnOutcome, TurnStep,
 };
 pub use react_agent::ReactAgent;

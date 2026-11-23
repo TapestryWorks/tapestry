@@ -19,7 +19,7 @@ pub mod tool;
 
 pub use agent::AgentLoop;
 pub use agent::{
-    Agent, AgentBindings, AgentFactory, ReactAgent, ReasoningOutput, StepOutput, StreamedMessage,
+    Agent, AgentDeps, AgentFactory, ReactAgent, ReasoningOutput, StepOutput, StreamedMessage,
     TurnContext, TurnOutcome, TurnStep,
 };
 pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
@@ -78,7 +78,7 @@ mod compatibility_tests {
     #[test]
     fn react_agent_matches_the_agent_trait() {
         let agent = crate::ReactAgent::new(
-            crate::AgentBindings::new(
+            crate::AgentDeps::new(
                 std::sync::Arc::new(crate::MockModelClient),
                 std::sync::Arc::new(crate::ToolRegistry::new()),
             ),

@@ -287,7 +287,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::agent::{Agent, AgentBindings, StepOutput, TurnOutcome, TurnStep};
+    use crate::agent::{Agent, AgentDeps, StepOutput, TurnOutcome, TurnStep};
     use crate::clock::FixedClock;
     use crate::formatter::prompt::render_system_reminder;
     use crate::formatter::{Formatter, OpenAiFormatter};
@@ -735,17 +735,13 @@ mod tests {
     }
 
     struct ThreadPolicy {
-        bindings: AgentBindings,
+        deps: AgentDeps,
     }
 
     #[async_trait::async_trait]
     impl Agent for ThreadPolicy {
-        fn bindings(&self) -> &AgentBindings {
-            &self.bindings
-        }
-
-        fn bindings_mut(&mut self) -> &mut AgentBindings {
-            &mut self.bindings
+        fn deps(&self) -> &AgentDeps {
+            &self.deps
         }
 
         async fn forward(
@@ -763,7 +759,7 @@ mod tests {
     async fn thread_uses_custom_forward_from_agent_loop_factory() {
         let model: Arc<dyn ModelClient> = Arc::new(MockModelClient);
         let loop_with_policy = AgentLoop::new(model.clone(), test_tools())
-            .with_agent_factory(|bindings, _| Box::new(ThreadPolicy { bindings }));
+            .with_agent_factory(|deps, _| Box::new(ThreadPolicy { deps }));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
             .agent_loop(loop_with_policy)
             .spawn();

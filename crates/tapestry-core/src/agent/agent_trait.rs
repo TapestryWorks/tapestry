@@ -46,15 +46,15 @@ pub struct TurnOutcome {
     pub last_agent_message: Option<String>,
 }
 
-/// Model, tools and middleware bound to an [`Agent`].
+/// Model, tools and middleware dependencies for an [`Agent`].
 #[derive(Clone)]
-pub struct AgentBindings {
+pub struct AgentDeps {
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolRegistry>,
     middlewares: Vec<Arc<dyn Middleware>>,
 }
 
-impl AgentBindings {
+impl AgentDeps {
     pub fn new(model: Arc<dyn ModelClient>, tools: Arc<ToolRegistry>) -> Self {
         Self {
             model,
@@ -332,24 +332,18 @@ pub struct ReasoningOutput {
 /// All middleware hooks run in registration order.
 #[async_trait]
 pub trait Agent: Send + Sync {
-    fn bindings(&self) -> &AgentBindings;
-
-    fn bindings_mut(&mut self) -> &mut AgentBindings;
+    fn deps(&self) -> &AgentDeps;
 
     fn model(&self) -> &Arc<dyn ModelClient> {
-        self.bindings().model()
+        self.deps().model()
     }
 
     fn tools(&self) -> &ToolRegistry {
-        self.bindings().tools()
+        self.deps().tools()
     }
 
     fn middlewares(&self) -> &[Arc<dyn Middleware>] {
-        self.bindings().middlewares()
-    }
-
-    fn bind_middleware(&mut self, middleware: Arc<dyn Middleware>) {
-        self.bindings_mut().push_middleware(middleware);
+        self.deps().middlewares()
     }
 
     /// Consumes one model stream and records its text deltas.
@@ -691,8 +685,8 @@ pub trait Agent: Send + Sync {
     }
 }
 
-/// Creates a fresh per-turn agent from its bindings and the thread configuration.
-pub type AgentFactory = Arc<dyn Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync>;
+/// Creates a fresh per-turn agent from its deps and the thread configuration.
+pub type AgentFactory = Arc<dyn Fn(AgentDeps, &ThreadConfig) -> Box<dyn Agent> + Send + Sync>;
 
 #[cfg(test)]
 mod tests {
@@ -812,8 +806,8 @@ mod tests {
             include_time_context: false,
             ..ThreadConfig::default()
         };
-        let bindings = AgentBindings::new(Arc::new(MockModelClient), Arc::new(ToolRegistry::new()));
-        let mut agent = crate::agent::ReactAgent::new(bindings, 1);
+        let deps = AgentDeps::new(Arc::new(MockModelClient), Arc::new(ToolRegistry::new()));
+        let mut agent = crate::agent::ReactAgent::new(deps, 1);
         let mut ctx = TurnContext::new(&mut recorder, &config, TurnId::new());
         agent.forward_with_hooks(&mut ctx).await.unwrap();
     }

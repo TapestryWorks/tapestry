@@ -13,12 +13,12 @@ use crate::model::ModelClient;
 use crate::recorder::Recorder;
 use crate::tool::ToolRegistry;
 
-use super::{Agent, AgentBindings, AgentFactory, ReactAgent, TurnContext};
+use super::{Agent, AgentDeps, AgentFactory, ReactAgent, TurnContext};
 
 /// Starts turns: records the turn prologue, then hands the turn to a fresh
-/// per-turn [`Agent`] built from the bound model, tools and middleware.
+/// per-turn [`Agent`] built from the configured model, tools and middleware.
 pub struct AgentLoop {
-    bindings: AgentBindings,
+    deps: AgentDeps,
     clock: Arc<dyn Clock>,
     agent_factory: AgentFactory,
 }
@@ -34,24 +34,24 @@ impl AgentLoop {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            bindings: AgentBindings::new(model, tools),
+            deps: AgentDeps::new(model, tools),
             clock,
-            agent_factory: Arc::new(|bindings, config| {
-                Box::new(ReactAgent::new(bindings, config.max_tool_iterations))
+            agent_factory: Arc::new(|deps, config| {
+                Box::new(ReactAgent::new(deps, config.max_tool_iterations))
             }),
         }
     }
 
     pub fn with_agent_factory(
         mut self,
-        factory: impl Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync + 'static,
+        factory: impl Fn(AgentDeps, &ThreadConfig) -> Box<dyn Agent> + Send + Sync + 'static,
     ) -> Self {
         self.agent_factory = Arc::new(factory);
         self
     }
 
     pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
-        self.bindings.push_middleware(middleware);
+        self.deps.push_middleware(middleware);
         self
     }
 
@@ -59,7 +59,7 @@ impl AgentLoop {
         mut self,
         middlewares: impl IntoIterator<Item = Arc<dyn Middleware>>,
     ) -> Self {
-        self.bindings = self.bindings.with_middlewares(middlewares);
+        self.deps = self.deps.with_middlewares(middlewares);
         self
     }
 
@@ -98,7 +98,7 @@ impl AgentLoop {
             .record(EventMsg::UserMessage(UserMessageEvent { name, content }))
             .await?;
 
-        let mut agent = (self.agent_factory)(self.bindings.clone(), config);
+        let mut agent = (self.agent_factory)(self.deps.clone(), config);
         let mut ctx = TurnContext::new(recorder, config, turn_id);
         agent.forward_with_hooks(&mut ctx).await
     }
@@ -635,19 +635,15 @@ mod tests {
     }
 
     struct OverriddenStepsAgent {
-        bindings: AgentBindings,
+        deps: AgentDeps,
         reasoning_calls: Arc<AtomicUsize>,
         acting_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
     impl Agent for OverriddenStepsAgent {
-        fn bindings(&self) -> &AgentBindings {
-            &self.bindings
-        }
-
-        fn bindings_mut(&mut self) -> &mut AgentBindings {
-            &mut self.bindings
+        fn deps(&self) -> &AgentDeps {
+            &self.deps
         }
 
         async fn reasoning(
@@ -684,16 +680,12 @@ mod tests {
         }
     }
 
-    struct OverriddenForwardAgent(AgentBindings);
+    struct OverriddenForwardAgent(AgentDeps);
 
     #[async_trait]
     impl Agent for OverriddenForwardAgent {
-        fn bindings(&self) -> &AgentBindings {
+        fn deps(&self) -> &AgentDeps {
             &self.0
-        }
-
-        fn bindings_mut(&mut self) -> &mut AgentBindings {
-            &mut self.0
         }
 
         async fn forward(&mut self, _ctx: &mut TurnContext<'_>) -> Result<TurnOutcome, CoreError> {
@@ -2479,9 +2471,9 @@ mod tests {
             .with_middleware(Arc::new(Probe::new("hooks", trace.clone())));
         let reasoning_count = reasoning_calls.clone();
         let acting_count = acting_calls.clone();
-        h.agent = h.agent.with_agent_factory(move |bindings, _| {
+        h.agent = h.agent.with_agent_factory(move |deps, _| {
             Box::new(OverriddenStepsAgent {
-                bindings,
+                deps,
                 reasoning_calls: reasoning_count.clone(),
                 acting_calls: acting_count.clone(),
             })
@@ -2543,7 +2535,7 @@ mod tests {
         h.agent = h.agent.with_middleware(Arc::new(probe));
         h.agent = h
             .agent
-            .with_agent_factory(|bindings, _| Box::new(OverriddenForwardAgent(bindings)));
+            .with_agent_factory(|deps, _| Box::new(OverriddenForwardAgent(deps)));
 
         let (result, events, _) = h.turn("go").await;
 
@@ -2593,9 +2585,9 @@ mod tests {
         for (requested, retained, allow_tools) in cases {
             let model = ScriptedModel::new(vec![resp(None, requested)]);
             let mut h = Harness::without_time(model, &ThreadConfig::default());
-            h.agent = h.agent.with_agent_factory(move |bindings, _| {
+            h.agent = h.agent.with_agent_factory(move |deps, _| {
                 Box::new(ScriptAgent::new(
-                    bindings,
+                    deps,
                     vec![
                         TurnStep::CallModel {
                             allow_tools,
@@ -2643,7 +2635,7 @@ mod tests {
         );
         h.agent = h
             .agent
-            .with_agent_factory(|bindings, _| Box::new(InfiniteAgent(bindings)));
+            .with_agent_factory(|deps, _| Box::new(InfiniteAgent(deps)));
 
         let (result, events, _) = h.turn("go").await;
         assert!(matches!(result, Err(CoreError::Internal(_))));
@@ -2671,9 +2663,9 @@ mod tests {
             resp(Some("answer"), vec![]),
         ]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
-        h.agent = h.agent.with_agent_factory(|bindings, _| {
+        h.agent = h.agent.with_agent_factory(|deps, _| {
             Box::new(ScriptAgent::new(
-                bindings,
+                deps,
                 vec![
                     TurnStep::CallModel { allow_tools: true },
                     TurnStep::CallModel {
@@ -2735,9 +2727,9 @@ mod tests {
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let captured = results.clone();
         let expected_second = second.clone();
-        h.agent = h.agent.with_agent_factory(move |bindings, _| {
+        h.agent = h.agent.with_agent_factory(move |deps, _| {
             Box::new(ScriptAgent::new(
-                bindings,
+                deps,
                 vec![
                     TurnStep::CallModel { allow_tools: true },
                     TurnStep::CallModel { allow_tools: true },
@@ -2805,9 +2797,9 @@ mod tests {
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let captured = results.clone();
         let expected_calls = calls.clone();
-        h.agent = h.agent.with_agent_factory(move |bindings, _| {
+        h.agent = h.agent.with_agent_factory(move |deps, _| {
             Box::new(ScriptAgent::new(
-                bindings,
+                deps,
                 vec![
                     TurnStep::CallModel { allow_tools: true },
                     TurnStep::Done {
@@ -2852,10 +2844,10 @@ mod tests {
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let created = Arc::new(AtomicUsize::new(0));
         let factory_created = created.clone();
-        h.agent = h.agent.with_agent_factory(move |bindings, _| {
+        h.agent = h.agent.with_agent_factory(move |deps, _| {
             factory_created.fetch_add(1, Ordering::SeqCst);
             Box::new(ScriptAgent::new(
-                bindings,
+                deps,
                 vec![
                     TurnStep::CallModel { allow_tools: true },
                     TurnStep::Done {

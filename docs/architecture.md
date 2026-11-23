@@ -135,7 +135,7 @@ adapter -> event
 
 ### State machine and driver
 
-`Agent` is an async, per-turn execution interface (`Send + Sync`). Implementors provide `AgentBindings` (model, `ToolRegistry`, middleware); the default methods implement the standard ReAct driver and can be overridden at three levels:
+`Agent` is an async, per-turn execution interface (`Send + Sync`). Implementors provide `AgentDeps` (model, `ToolRegistry`, middleware); the default methods implement the standard ReAct driver and can be overridden at three levels:
 
 - `reasoning(ctx, request: ModelRequest)` is the single model execution point. Its default implementation consumes `ModelClient::stream`, records text deltas, and returns a `ReasoningOutput`. It does not expose a `Recorder` to the model implementation.
 - `acting(call: &ToolCall)` is the single-tool execution point. Its default implementation calls the matching registered tool and returns `NotFound` for unknown tools.
@@ -151,12 +151,12 @@ The model step records `ModelRequestStarted`, flushes queued reminders, reads th
 
 After each successful model step and each complete tool batch, the scheduler computes a default next step and runs `after_step` with a read-only `StepOutput` and that mutable plan. Later middleware can replace a nonterminal plan. `Done` is locked when it is the default or first selected; later middleware still observes it but cannot change the termination or its outcome. Invalid transitions are runtime errors. If the selected model step does not execute its returned tool calls, the complete assistant message omits those calls, preserves text and records a warning with the ignored count. This avoids dangling calls in history.
 
-`AgentLoop` starts turns: it records `TurnStarted`, the optional environment context and the user message, then creates a fresh agent with its `AgentFactory` (`Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent>`, receiving the loop's model, tools and middleware) and runs `forward_with_hooks`. Install custom agents with `AgentLoop::with_agent_factory` and inject the configured loop with `ThreadBuilder::agent_loop(AgentLoop)`.
+`AgentLoop` starts turns: it records `TurnStarted`, the optional environment context and the user message, then creates a fresh agent with its `AgentFactory` (`Fn(AgentDeps, &ThreadConfig) -> Box<dyn Agent>`, receiving the loop's model, tools and middleware) and runs `forward_with_hooks`. Install custom agents with `AgentLoop::with_agent_factory` and inject the configured loop with `ThreadBuilder::agent_loop(AgentLoop)`.
 
 ### Middleware hooks
 
-Middleware is bound to an agent through `AgentBindings` or
-`Agent::bind_middleware`; `AgentLoop::with_middleware` / `with_middlewares`
+Middleware is bound through `AgentDeps` or `AgentLoop::with_middleware` /
+`with_middlewares`
 bind it to every agent the loop creates, and the constructors default to none.
 All hooks run in middleware registration order, including `after_turn`,
 `after_model`, `after_tool` and `after_step`. `HookCtx` provides the thread id,
