@@ -621,7 +621,9 @@ pub trait Agent: Send + Sync {
     async fn forward_with_hooks(&mut self, ctx: &mut TurnContext<'_>) -> Result<(), CoreError> {
         let hook_ctx = ctx.hook_ctx(None);
         for middleware in self.middlewares() {
-            middleware.before_turn(&hook_ctx, &mut ctx.initial_step).await?;
+            middleware
+                .before_turn(&hook_ctx, &mut ctx.initial_step)
+                .await?;
         }
         ctx.flush_reminders().await?;
         let outcome = self.forward(ctx).await?;
