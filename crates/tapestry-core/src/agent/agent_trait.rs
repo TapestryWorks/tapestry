@@ -275,6 +275,36 @@ impl<'a> TurnContext<'a> {
         }
         Ok(())
     }
+
+    pub async fn record_assistant_message(
+        &mut self,
+        streamed: Option<StreamedMessage>,
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<(), CoreError> {
+        if content.is_none() && tool_calls.is_empty() {
+            return Ok(());
+        }
+        let message_id = streamed
+            .as_ref()
+            .map(|message| message.message_id)
+            .unwrap_or_default();
+        if streamed.is_none() {
+            self.recorder
+                .record(EventMsg::AssistantMessageStart(
+                    AssistantMessageStartEvent { message_id },
+                ))
+                .await?;
+        }
+        self.recorder
+            .record(EventMsg::AssistantMessage(AssistantMessageEvent {
+                message_id,
+                content,
+                tool_calls,
+            }))
+            .await?;
+        Ok(())
+    }
 }
 
 /// Text streamed as deltas for one assistant message.
@@ -434,8 +464,50 @@ pub trait Agent: Send + Sync {
         calls: Vec<ToolCall>,
     ) -> Result<Vec<ToolResult>, CoreError> {
         let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(run_tool_call(self, ctx, call).await?);
+        for mut call in calls {
+            let hook_ctx = ctx.hook_ctx(Some(ctx.iteration()));
+            let original_id = call.id.clone();
+            let original_name = call.name.clone();
+            let mut decision = ToolDecision::Continue;
+            for middleware in self.middlewares() {
+                decision = middleware.before_tool(&hook_ctx, &mut call).await?;
+                if matches!(decision, ToolDecision::Skip(_)) {
+                    break;
+                }
+            }
+            call.id = original_id;
+            call.name = original_name;
+            ctx.recorder
+                .record(EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                }))
+                .await?;
+
+            let started = Instant::now();
+            let skipped = matches!(decision, ToolDecision::Skip(_));
+            let mut result = match decision {
+                ToolDecision::Skip(result) => result,
+                ToolDecision::Continue => self.acting(&call).await,
+            };
+            for middleware in self.middlewares() {
+                middleware.after_tool(&hook_ctx, &call, &mut result).await?;
+            }
+            result.call_id = call.id.clone();
+            result.tool_name = call.name.clone();
+            let duration_ms = if skipped {
+                0
+            } else {
+                started.elapsed().as_millis() as u64
+            };
+            ctx.recorder
+                .record(EventMsg::ToolCallEnd(ToolCallEndEvent {
+                    result: result.clone(),
+                    duration_ms: Some(duration_ms),
+                }))
+                .await?;
+            results.push(result);
         }
         Ok(results)
     }
@@ -532,7 +604,8 @@ pub trait Agent: Send + Sync {
                         Vec::new()
                     };
                     let ignored = ignored + if execute_batch { 0 } else { calls.len() };
-                    record_assistant_message(ctx, streamed, content, retained_calls).await?;
+                    ctx.record_assistant_message(streamed, content, retained_calls)
+                        .await?;
                     if ignored > 0 {
                         ctx.recorder
                             .record(EventMsg::Warning(WarningEvent {
@@ -561,7 +634,17 @@ pub trait Agent: Send + Sync {
         for middleware in self.middlewares() {
             middleware.after_turn(&hook_ctx).await?;
         }
-        complete_turn(ctx, outcome).await
+        ctx.flush_reminders().await?;
+        ctx.recorder
+            .record(EventMsg::TokenCount(TokenCountEvent { usage: ctx.usage }))
+            .await?;
+        ctx.recorder
+            .record(EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: outcome.last_agent_message,
+                finish_reason: outcome.finish,
+            }))
+            .await?;
+        Ok(())
     }
 
     async fn schedule_after_step(
@@ -610,100 +693,6 @@ pub trait Agent: Send + Sync {
 
 /// Creates a fresh per-turn agent from its bindings and the thread configuration.
 pub type AgentFactory = Arc<dyn Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync>;
-
-async fn record_assistant_message(
-    ctx: &mut TurnContext<'_>,
-    streamed: Option<StreamedMessage>,
-    content: Option<String>,
-    tool_calls: Vec<ToolCall>,
-) -> Result<(), CoreError> {
-    if content.is_none() && tool_calls.is_empty() {
-        return Ok(());
-    }
-    let message_id = streamed
-        .as_ref()
-        .map(|message| message.message_id)
-        .unwrap_or_default();
-    if streamed.is_none() {
-        ctx.recorder
-            .record(EventMsg::AssistantMessageStart(
-                AssistantMessageStartEvent { message_id },
-            ))
-            .await?;
-    }
-    ctx.recorder
-        .record(EventMsg::AssistantMessage(AssistantMessageEvent {
-            message_id,
-            content,
-            tool_calls,
-        }))
-        .await?;
-    Ok(())
-}
-
-async fn run_tool_call<A: Agent + ?Sized>(
-    agent: &A,
-    ctx: &mut TurnContext<'_>,
-    mut call: ToolCall,
-) -> Result<ToolResult, CoreError> {
-    let hook_ctx = ctx.hook_ctx(Some(ctx.iteration()));
-    let original_id = call.id.clone();
-    let original_name = call.name.clone();
-    let mut decision = ToolDecision::Continue;
-    for middleware in agent.middlewares() {
-        decision = middleware.before_tool(&hook_ctx, &mut call).await?;
-        if matches!(decision, ToolDecision::Skip(_)) {
-            break;
-        }
-    }
-    call.id = original_id;
-    call.name = original_name;
-    ctx.recorder
-        .record(EventMsg::ToolCallBegin(ToolCallBeginEvent {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            arguments: call.arguments.clone(),
-        }))
-        .await?;
-
-    let started = Instant::now();
-    let skipped = matches!(decision, ToolDecision::Skip(_));
-    let mut result = match decision {
-        ToolDecision::Skip(result) => result,
-        ToolDecision::Continue => agent.acting(&call).await,
-    };
-    for middleware in agent.middlewares() {
-        middleware.after_tool(&hook_ctx, &call, &mut result).await?;
-    }
-    result.call_id = call.id.clone();
-    result.tool_name = call.name.clone();
-    let duration_ms = if skipped {
-        0
-    } else {
-        started.elapsed().as_millis() as u64
-    };
-    ctx.recorder
-        .record(EventMsg::ToolCallEnd(ToolCallEndEvent {
-            result: result.clone(),
-            duration_ms: Some(duration_ms),
-        }))
-        .await?;
-    Ok(result)
-}
-
-async fn complete_turn(ctx: &mut TurnContext<'_>, outcome: TurnOutcome) -> Result<(), CoreError> {
-    ctx.flush_reminders().await?;
-    ctx.recorder
-        .record(EventMsg::TokenCount(TokenCountEvent { usage: ctx.usage }))
-        .await?;
-    ctx.recorder
-        .record(EventMsg::TurnComplete(TurnCompleteEvent {
-            last_agent_message: outcome.last_agent_message,
-            finish_reason: outcome.finish,
-        }))
-        .await?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
