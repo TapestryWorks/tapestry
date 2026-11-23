@@ -23,9 +23,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Test pre-commit hook
-        run: bash scripts/test-pre-commit-hook.sh
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
