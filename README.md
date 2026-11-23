@@ -16,6 +16,25 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 | [`tapestry-adapter-a2a`](crates/tapestry-adapter-a2a) | Tapestry event stream to A2A 1.0 streaming responses |
 | [`tapestry-cli`](crates/tapestry-cli) | Run one agent turn and stream its events in the terminal |
 
+## Git pre-commit formatting hook
+
+Install the repository's local Git hook once per clone:
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+After installation, `git commit` automatically runs `cargo fmt --all` when
+staged Rust files are present, re-stages those formatted files, and verifies
+`cargo fmt --all -- --check`. No separate formatting command is needed.
+
+**Safety:** If any tracked Rust file has unstaged edits, the hook stops before
+formatting; stage or stash those edits first. If formatting changes a Rust file
+that was not already staged, the hook stops and asks you to review and stage it
+explicitly. Non-Rust-only commits skip formatting. The hook requires Cargo.
+To disable the repository hook, run `git config --local --unset core.hooksPath`
+(note that doing so also disables any other hooks in this directory).
+
 ## Quick start
 
 ```bash
