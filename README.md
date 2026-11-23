@@ -16,24 +16,25 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 | [`tapestry-adapter-a2a`](crates/tapestry-adapter-a2a) | Tapestry event stream to A2A 1.0 streaming responses |
 | [`tapestry-cli`](crates/tapestry-cli) | Run one agent turn and stream its events in the terminal |
 
-## Git pre-commit formatting hook
+## Pre-commit formatting
 
-Install the repository's local Git hook once per clone:
+This repository uses [pre-commit](https://pre-commit.com/) to run
+`cargo fmt --all` before commits containing Rust files.
+
+Install once per clone (requires Rust/Cargo and Python/pip):
 
 ```bash
-bash scripts/install-hooks.sh
+python3 -m pip install pre-commit
+pre-commit install
 ```
 
-After installation, `git commit` automatically runs `cargo fmt --all` when
-staged Rust files are present, re-stages those formatted files, and verifies
-`cargo fmt --all -- --check`. No separate formatting command is needed.
+When formatting changes a file, pre-commit stops the commit so you can review
+the diff, stage the formatted files, and commit again. This avoids automatically
+staging unrelated edits. Run `pre-commit run --all-files` to check manually,
+or `pre-commit uninstall` to remove the hook.
 
-**Safety:** If any tracked Rust file has unstaged edits, the hook stops before
-formatting; stage or stash those edits first. If formatting changes a Rust file
-that was not already staged, the hook stops and asks you to review and stage it
-explicitly. Non-Rust-only commits skip formatting. The hook requires Cargo.
-To disable the repository hook, run `git config --local --unset core.hooksPath`
-(note that doing so also disables any other hooks in this directory).
+If you previously installed the custom hook from an earlier revision of this PR,
+run `git config --local --unset core.hooksPath` before `pre-commit install`.
 
 ## Quick start
 
