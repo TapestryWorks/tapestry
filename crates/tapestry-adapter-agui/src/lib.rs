@@ -691,7 +691,6 @@ mod tests {
                 context: EnvironmentContext::Unavailable,
             },
             SystemReminderEvent {
-                iteration: 0,
                 reminder: SystemReminder::ToolLimitReached,
             },
             ToolCallBeginEvent {

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use tapestry_protocol::{
-    AssistantMessageDeltaEvent, AssistantMessageEvent, AssistantMessageStartEvent, EventMsg,
+    AssistantMessageDeltaEvent, AssistantMessageEvent, AssistantMessageStartEvent, Event, EventMsg,
     FinishReason, MessageId, ModelRequest, ModelRequestCompletedEvent, ModelRequestStartedEvent,
     ModelResponse, ModelStreamItem, SystemReminder, SystemReminderEvent, TokenCountEvent,
     TokenUsage, ToolCall, ToolCallBeginEvent, ToolCallEndEvent, ToolResult, TurnCompleteEvent,
@@ -15,6 +15,7 @@ use crate::error::CoreError;
 use crate::middleware::{HookCtx, Middleware, ToolDecision};
 use crate::model::ModelClient;
 use crate::recorder::Recorder;
+use crate::reminder::ReminderQueue;
 use crate::tool::ToolRegistry;
 
 /// What the turn driver should do next.
@@ -22,7 +23,6 @@ use crate::tool::ToolRegistry;
 pub enum TurnStep {
     CallModel {
         allow_tools: bool,
-        reminder: Option<SystemReminder>,
     },
     /// Execute the complete, ordered tool batch stored in [`TurnContext`].
     CallTool,
@@ -105,6 +105,7 @@ pub struct TurnContext<'a> {
     open_usage: Option<TokenUsage>,
     initial_step: Option<TurnStep>,
     tool_batch: Option<Vec<ToolCall>>,
+    reminders: Arc<ReminderQueue>,
 }
 
 impl<'a> TurnContext<'a> {
@@ -120,6 +121,7 @@ impl<'a> TurnContext<'a> {
             open_usage: None,
             initial_step: None,
             tool_batch: None,
+            reminders: Arc::new(ReminderQueue::default()),
         }
     }
 
@@ -143,12 +145,34 @@ impl<'a> TurnContext<'a> {
     }
 
     pub fn hook_ctx(&self, iteration: Option<u32>) -> HookCtx<'a> {
-        HookCtx {
-            thread_id: self.recorder.thread_id(),
-            turn_id: self.turn_id,
+        HookCtx::with_queue(
+            self.recorder.thread_id(),
+            self.turn_id,
             iteration,
-            config: self.config,
+            self.config,
+            Arc::clone(&self.reminders),
+        )
+    }
+
+    /// Queue a reminder; it is recorded by the next [`TurnContext::flush_reminders`].
+    pub fn remind(&self, reminder: SystemReminder) {
+        self.reminders.push(reminder);
+    }
+
+    /// Record every queued reminder, in the order added, and return the events.
+    ///
+    /// A recorded reminder is consumed by the first `ModelRequestCompleted`
+    /// after it, so drivers flush only where the next request should see it.
+    pub async fn flush_reminders(&mut self) -> Result<Vec<Event>, CoreError> {
+        let mut events = Vec::new();
+        for reminder in self.reminders.drain() {
+            events.push(
+                self.recorder
+                    .record(EventMsg::SystemReminder(SystemReminderEvent { reminder }))
+                    .await?,
+            );
         }
+        Ok(events)
     }
 
     /// Set the plan selected by the turn-level `before_turn` hooks.
@@ -288,40 +312,6 @@ pub trait Agent: Send + Sync {
         self.bindings_mut().push_middleware(middleware);
     }
 
-    /// Builds a request from a fresh event snapshot and records its start.
-    async fn prepare_request(
-        &self,
-        ctx: &mut TurnContext<'_>,
-        allow_tools: bool,
-        reminder: Option<SystemReminder>,
-    ) -> Result<ModelRequest, CoreError> {
-        let iteration = ctx.iteration();
-        ctx.recorder
-            .record(EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
-                iteration,
-                allow_tools,
-            }))
-            .await?;
-        if let Some(reminder) = reminder {
-            ctx.recorder
-                .record(EventMsg::SystemReminder(SystemReminderEvent {
-                    iteration,
-                    reminder,
-                }))
-                .await?;
-        }
-        Ok(ModelRequest {
-            system_prompt: ctx.config.effective_system_prompt(),
-            events: ctx.recorder.events().await?,
-            tools: if allow_tools {
-                self.tools().specs()
-            } else {
-                Vec::new()
-            },
-            iteration,
-        })
-    }
-
     /// Consumes one model stream and records its text deltas.
     async fn reasoning(
         &self,
@@ -372,25 +362,44 @@ pub trait Agent: Send + Sync {
         ))
     }
 
-    /// Builds a request, runs model hooks, then calls the overridable
-    /// [`Agent::reasoning`] method with that complete request.
+    /// Records the request start, assembles the event snapshot, runs the
+    /// read-only model hooks, then calls the overridable [`Agent::reasoning`].
+    ///
+    /// Reminders written before or by `before_model` are recorded before the
+    /// snapshot is final, so this request delivers them. Reminders written by
+    /// `after_model` stay queued for the driver to flush.
     async fn reasoning_with_hooks(
         &self,
         ctx: &mut TurnContext<'_>,
         allow_tools: bool,
-        reminder: Option<SystemReminder>,
     ) -> Result<ReasoningOutput, CoreError> {
-        let mut request = self.prepare_request(ctx, allow_tools, reminder).await?;
-        let hook_ctx = ctx.hook_ctx(Some(ctx.iteration()));
+        let iteration = ctx.iteration();
+        ctx.recorder
+            .record(EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
+                iteration,
+                allow_tools,
+            }))
+            .await?;
+        ctx.flush_reminders().await?;
+        let mut events = ctx.recorder.events().await?;
+        let hook_ctx = ctx.hook_ctx(Some(iteration));
         for middleware in self.middlewares() {
-            middleware.before_model(&hook_ctx, &mut request).await?;
+            middleware.before_model(&hook_ctx, &events).await?;
         }
-        validate_model_request(&request, allow_tools, ctx.iteration())?;
-        let mut output = self.reasoning(ctx, request).await?;
+        events.extend(ctx.flush_reminders().await?);
+        let request = ModelRequest {
+            system_prompt: ctx.config.effective_system_prompt(),
+            events,
+            tools: if allow_tools {
+                self.tools().specs()
+            } else {
+                Vec::new()
+            },
+            iteration,
+        };
+        let output = self.reasoning(ctx, request).await?;
         for middleware in self.middlewares() {
-            middleware
-                .after_model(&hook_ctx, &mut output.response)
-                .await?;
+            middleware.after_model(&hook_ctx, &output.response).await?;
         }
         Ok(output)
     }
@@ -426,9 +435,14 @@ pub trait Agent: Send + Sync {
     /// This method does not run turn hooks or record completion events, but
     /// it does run model, tool, and step hooks.
     async fn forward(&mut self, ctx: &mut TurnContext<'_>) -> Result<TurnOutcome, CoreError> {
-        let mut step = ctx
-            .take_initial_step()
-            .unwrap_or_else(|| initial_step(ctx.config.max_tool_iterations, ctx.iteration()));
+        let mut step = match ctx.take_initial_step() {
+            Some(step) => step,
+            None => {
+                let step = initial_step(ctx);
+                ctx.flush_reminders().await?;
+                step
+            }
+        };
 
         loop {
             match step {
@@ -447,15 +461,12 @@ pub trait Agent: Send + Sync {
                     let next_iteration = ctx.iteration().checked_add(1);
                     let next = match next_iteration {
                         Some(iteration) if iteration < ctx.config.max_tool_iterations => {
-                            TurnStep::CallModel {
-                                allow_tools: true,
-                                reminder: None,
-                            }
+                            TurnStep::CallModel { allow_tools: true }
                         }
-                        Some(_) => TurnStep::CallModel {
-                            allow_tools: false,
-                            reminder: Some(SystemReminder::ToolLimitReached),
-                        },
+                        Some(_) => {
+                            ctx.remind(SystemReminder::ToolLimitReached);
+                            TurnStep::CallModel { allow_tools: false }
+                        }
                         None => TurnStep::Done {
                             finish: FinishReason::ExceedMaxIters,
                             last_agent_message: None,
@@ -465,21 +476,18 @@ pub trait Agent: Send + Sync {
                     self.schedule_after_step(ctx, StepOutput::Tools(&results), &mut next)
                         .await?;
                     ctx.finish_model_iteration().await?;
+                    ctx.flush_reminders().await?;
                     step = next;
                 }
-                TurnStep::CallModel {
-                    allow_tools,
-                    reminder,
-                } => {
+                TurnStep::CallModel { allow_tools } => {
                     if allow_tools && ctx.iteration() >= ctx.config.max_tool_iterations {
                         return Err(CoreError::Internal(
                             "agent enabled tools after the tool iteration budget".into(),
                         ));
                     }
                     let iteration = ctx.begin_model_iteration()?;
-                    let ReasoningOutput { response, streamed } = self
-                        .reasoning_with_hooks(ctx, allow_tools, reminder)
-                        .await?;
+                    let ReasoningOutput { response, streamed } =
+                        self.reasoning_with_hooks(ctx, allow_tools).await?;
                     ctx.set_model_usage(response.usage)?;
                     let content = response
                         .content
@@ -531,6 +539,7 @@ pub trait Agent: Send + Sync {
                     }
                     if !execute_batch {
                         ctx.finish_model_iteration().await?;
+                        ctx.flush_reminders().await?;
                     }
                     step = next;
                 }
@@ -541,11 +550,12 @@ pub trait Agent: Send + Sync {
     /// Runs turn hooks around the overridable flow and records completion once.
     async fn forward_with_hooks(&mut self, ctx: &mut TurnContext<'_>) -> Result<(), CoreError> {
         let hook_ctx = ctx.hook_ctx(None);
-        let mut initial = initial_step(ctx.config.max_tool_iterations, ctx.iteration());
+        let mut initial = initial_step(ctx);
         for middleware in self.middlewares() {
             middleware.before_turn(&hook_ctx, &mut initial).await?;
         }
         ctx.set_initial_step(initial);
+        ctx.flush_reminders().await?;
         let outcome = self.forward(ctx).await?;
         for middleware in self.middlewares() {
             middleware.after_turn(&hook_ctx).await?;
@@ -580,7 +590,7 @@ pub trait Agent: Send + Sync {
             TurnStep::CallTool if !ctx.has_tool_batch() => Err(CoreError::Internal(
                 "agent selected CallTool without a pending tool batch".into(),
             )),
-            TurnStep::CallModel { allow_tools, .. }
+            TurnStep::CallModel { allow_tools }
                 if *allow_tools
                     && ctx
                         .open_iteration
@@ -600,30 +610,13 @@ pub trait Agent: Send + Sync {
 /// Creates a fresh per-turn agent from its bindings and the thread configuration.
 pub type AgentFactory = Arc<dyn Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync>;
 
-fn initial_step(max_tool_iterations: u32, iteration: u32) -> TurnStep {
-    let allow_tools = iteration < max_tool_iterations;
-    TurnStep::CallModel {
-        allow_tools,
-        reminder: (!allow_tools).then_some(SystemReminder::ToolLimitReached),
+/// First step of a turn; queues the limit reminder when no tool call is allowed.
+fn initial_step(ctx: &TurnContext<'_>) -> TurnStep {
+    let allow_tools = ctx.iteration() < ctx.config.max_tool_iterations;
+    if !allow_tools {
+        ctx.remind(SystemReminder::ToolLimitReached);
     }
-}
-
-fn validate_model_request(
-    request: &ModelRequest,
-    allow_tools: bool,
-    iteration: u32,
-) -> Result<(), CoreError> {
-    if request.iteration != iteration {
-        return Err(CoreError::Internal(
-            "middleware changed the model request iteration".into(),
-        ));
-    }
-    if !allow_tools && !request.tools.is_empty() {
-        return Err(CoreError::Internal(
-            "middleware re-enabled tools for a tool-disabled model request".into(),
-        ));
-    }
-    Ok(())
+    TurnStep::CallModel { allow_tools }
 }
 
 async fn record_assistant_message(
@@ -707,6 +700,7 @@ async fn run_tool_call<A: Agent + ?Sized>(
 }
 
 async fn complete_turn(ctx: &mut TurnContext<'_>, outcome: TurnOutcome) -> Result<(), CoreError> {
+    ctx.flush_reminders().await?;
     ctx.recorder
         .record(EventMsg::TokenCount(TokenCountEvent { usage: ctx.usage }))
         .await?;
@@ -765,21 +759,49 @@ mod tests {
         assert!(!other.has_tool_batch());
     }
 
-    #[test]
-    fn disabled_tool_requests_cannot_be_reenabled_by_middleware() {
-        let request = ModelRequest {
-            system_prompt: None,
-            events: Vec::new(),
-            tools: vec![tapestry_protocol::ToolSpec {
-                name: "echo".into(),
-                description: String::new(),
-                parameters: serde_json::Value::Null,
-            }],
-            iteration: 2,
-        };
-        assert!(validate_model_request(&request, false, 2).is_err());
-        assert!(validate_model_request(&request, true, 2).is_ok());
-        assert!(validate_model_request(&request, true, 1).is_err());
+    #[tokio::test]
+    async fn flush_records_queued_reminders_in_order_through_hook_contexts() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let clock = Arc::new(FixedClock::new("2026-11-23", "UTC"));
+        let mut recorder = Recorder::new(store, clock, ThreadId::new());
+        let config = ThreadConfig::default();
+        let mut ctx = TurnContext::new(&mut recorder, &config, TurnId::new());
+
+        ctx.remind(SystemReminder::custom("agent"));
+        ctx.hook_ctx(None).remind(SystemReminder::custom("hook"));
+        let events = ctx.flush_reminders().await.unwrap();
+
+        let texts: Vec<_> = events
+            .iter()
+            .map(|event| match &event.msg {
+                EventMsg::SystemReminder(r) => r.reminder.clone(),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                SystemReminder::custom("agent"),
+                SystemReminder::custom("hook")
+            ]
+        );
+        assert!(ctx.flush_reminders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_propagates_event_store_failure() {
+        let store = Arc::new(crate::store::testing::FlakyStore::default());
+        store.fail_after(0);
+        let clock = Arc::new(FixedClock::new("2026-11-23", "UTC"));
+        let mut recorder = Recorder::new(store, clock, ThreadId::new());
+        let config = ThreadConfig::default();
+        let mut ctx = TurnContext::new(&mut recorder, &config, TurnId::new());
+
+        ctx.remind(SystemReminder::ToolLimitReached);
+        assert!(matches!(
+            ctx.flush_reminders().await,
+            Err(CoreError::EventStore(_))
+        ));
     }
 
     #[tokio::test]

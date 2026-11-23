@@ -84,7 +84,7 @@ impl AgentLoop {
             .record(EventMsg::TurnStarted(TurnStartedEvent {}))
             .await?;
         if let Some(context) = next_context_entry(
-            recorder.history(),
+            &recorder.messages(),
             config.include_time_context,
             self.clock.as_ref(),
         ) {
@@ -113,7 +113,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use tapestry_protocol::{
-        EnvironmentContext, Event, FinishReason, HistoryItem, MessageId, ModelRequest,
+        ConversationItem, EnvironmentContext, Event, FinishReason, MessageId, ModelRequest,
         ModelResponse, ModelStreamItem, SubmissionId, SystemReminder, ThreadId, TokenUsage,
         ToolCall, ToolCallId, ToolCallStatus, ToolResult, ToolSpec,
     };
@@ -121,15 +121,15 @@ mod tests {
     use super::*;
     use crate::agent::{ReasoningOutput, StepOutput, TurnContext, TurnOutcome, TurnStep};
     use crate::clock::FixedClock;
-    use crate::formatter::formatter_trait::HistoryProjection;
+    use crate::formatter::formatter_trait::ConversationProjection;
     use crate::middleware::{HookCtx, ToolDecision};
     use crate::model::{MockModelClient, ModelStream};
     use crate::store::testing::FlakyStore;
     use crate::store::{EventStore, InMemoryEventStore};
     use crate::tool::{EchoTool, Tool};
 
-    fn request_history(request: &ModelRequest) -> Vec<HistoryItem> {
-        HistoryProjection::fold(&request.events).history().to_vec()
+    fn request_history(request: &ModelRequest) -> Vec<ConversationItem> {
+        ConversationProjection::fold(&request.events).messages()
     }
 
     fn tc(name: &str, arguments: Value) -> ToolCall {
@@ -312,8 +312,12 @@ mod tests {
     struct Probe {
         label: &'static str,
         trace: Arc<Mutex<Vec<String>>>,
-        prompt_suffix: Option<&'static str>,
-        uppercase_response: bool,
+        before_model_reminder: Option<&'static str>,
+        after_model_reminder: Option<&'static str>,
+        before_tool_reminder: Option<&'static str>,
+        after_tool_reminder: Option<&'static str>,
+        after_step_reminder: Option<&'static str>,
+        seen_events: Option<Arc<Mutex<Vec<Vec<Event>>>>>,
         tool_input: Option<&'static str>,
         append_tool_input: Option<&'static str>,
         skip_output: Option<&'static str>,
@@ -335,8 +339,12 @@ mod tests {
             Self {
                 label,
                 trace,
-                prompt_suffix: None,
-                uppercase_response: false,
+                before_model_reminder: None,
+                after_model_reminder: None,
+                before_tool_reminder: None,
+                after_tool_reminder: None,
+                after_step_reminder: None,
+                seen_events: None,
                 tool_input: None,
                 append_tool_input: None,
                 skip_output: None,
@@ -393,44 +401,41 @@ mod tests {
             Ok(())
         }
 
-        async fn before_model(
-            &self,
-            _ctx: &HookCtx<'_>,
-            request: &mut ModelRequest,
-        ) -> Result<(), CoreError> {
+        async fn before_model(&self, ctx: &HookCtx<'_>, events: &[Event]) -> Result<(), CoreError> {
             self.record("before_model");
             if self.fail_before_model {
                 return Err(CoreError::Tool("middleware before_model failed".into()));
             }
-            if let Some(suffix) = self.prompt_suffix {
-                request
-                    .system_prompt
-                    .get_or_insert_with(String::new)
-                    .push_str(suffix);
+            if let Some(seen) = &self.seen_events {
+                seen.lock().unwrap().push(events.to_vec());
+            }
+            if let Some(text) = self.before_model_reminder {
+                ctx.remind(SystemReminder::custom(text));
             }
             Ok(())
         }
 
         async fn after_model(
             &self,
-            _ctx: &HookCtx<'_>,
-            response: &mut ModelResponse,
+            ctx: &HookCtx<'_>,
+            _response: &ModelResponse,
         ) -> Result<(), CoreError> {
             self.record("after_model");
-            if self.uppercase_response {
-                if let Some(content) = &mut response.content {
-                    content.make_ascii_uppercase();
-                }
+            if let Some(text) = self.after_model_reminder {
+                ctx.remind(SystemReminder::custom(text));
             }
             Ok(())
         }
 
         async fn before_tool(
             &self,
-            _ctx: &HookCtx<'_>,
+            ctx: &HookCtx<'_>,
             call: &mut ToolCall,
         ) -> Result<ToolDecision, CoreError> {
             self.record("before_tool");
+            if let Some(text) = self.before_tool_reminder {
+                ctx.remind(SystemReminder::custom(text));
+            }
             if let Some(count) = &self.tool_count {
                 count.fetch_add(1, Ordering::SeqCst);
             }
@@ -453,11 +458,14 @@ mod tests {
 
         async fn after_tool(
             &self,
-            _ctx: &HookCtx<'_>,
+            ctx: &HookCtx<'_>,
             _call: &ToolCall,
             result: &mut ToolResult,
         ) -> Result<(), CoreError> {
             self.record("after_tool");
+            if let Some(text) = self.after_tool_reminder {
+                ctx.remind(SystemReminder::custom(text));
+            }
             if let Some(output) = self.after_output {
                 result.output = output.into();
             }
@@ -473,11 +481,14 @@ mod tests {
 
         async fn after_step(
             &self,
-            _ctx: &HookCtx<'_>,
+            ctx: &HookCtx<'_>,
             _output: &StepOutput<'_>,
             next_step: &mut TurnStep,
         ) -> Result<(), CoreError> {
             self.record("after_step");
+            if let Some(text) = self.after_step_reminder {
+                ctx.remind(SystemReminder::custom(text));
+            }
             if self.fail_after_step {
                 return Err(CoreError::Tool("middleware after_step failed".into()));
             }
@@ -504,10 +515,7 @@ mod tests {
             next_step: &mut TurnStep,
         ) -> Result<(), CoreError> {
             if matches!(output, StepOutput::Model(response) if !response.tool_calls.is_empty()) {
-                *next_step = TurnStep::CallModel {
-                    allow_tools: true,
-                    reminder: None,
-                };
+                *next_step = TurnStep::CallModel { allow_tools: true };
             }
             Ok(())
         }
@@ -551,24 +559,6 @@ mod tests {
         }
     }
 
-    struct ReenableTools;
-
-    #[async_trait]
-    impl Middleware for ReenableTools {
-        async fn before_model(
-            &self,
-            _ctx: &HookCtx<'_>,
-            request: &mut ModelRequest,
-        ) -> Result<(), CoreError> {
-            request.tools.push(ToolSpec {
-                name: "echo".into(),
-                description: "attempted re-enable".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            });
-            Ok(())
-        }
-    }
-
     type IterationLog = Arc<Mutex<Vec<(&'static str, Option<u32>)>>>;
 
     struct IterationCapture(IterationLog);
@@ -578,7 +568,7 @@ mod tests {
         async fn before_model(
             &self,
             ctx: &HookCtx<'_>,
-            _request: &mut ModelRequest,
+            _events: &[Event],
         ) -> Result<(), CoreError> {
             self.0.lock().unwrap().push(("before_model", ctx.iteration));
             Ok(())
@@ -587,7 +577,7 @@ mod tests {
         async fn after_model(
             &self,
             ctx: &HookCtx<'_>,
-            _response: &mut ModelResponse,
+            _response: &ModelResponse,
         ) -> Result<(), CoreError> {
             self.0.lock().unwrap().push(("after_model", ctx.iteration));
             Ok(())
@@ -803,21 +793,19 @@ mod tests {
             (result, events, sid)
         }
 
-        fn history(&self) -> &[HistoryItem] {
-            self.recorder.history()
+        fn history(&self) -> Vec<ConversationItem> {
+            self.recorder.messages()
         }
 
-        async fn folded(&self) -> Vec<HistoryItem> {
-            HistoryProjection::fold(&self.log().await)
-                .history()
-                .to_vec()
+        async fn folded(&self) -> Vec<ConversationItem> {
+            ConversationProjection::fold(&self.log().await).messages()
         }
 
-        fn context_entries(&self) -> Vec<&EnvironmentContext> {
+        fn context_entries(&self) -> Vec<EnvironmentContext> {
             self.history()
-                .iter()
+                .into_iter()
                 .filter_map(|i| match i {
-                    HistoryItem::EnvironmentContext(context) => Some(context),
+                    ConversationItem::EnvironmentContext(context) => Some(context),
                     _ => None,
                 })
                 .collect()
@@ -859,13 +847,13 @@ mod tests {
             .collect()
     }
 
-    fn assert_history_valid(history: &[HistoryItem]) {
+    fn assert_history_valid(history: &[ConversationItem]) {
         for item in history {
-            if let HistoryItem::Assistant { tool_calls, .. } = item {
+            if let ConversationItem::Assistant { tool_calls, .. } = item {
                 for call in tool_calls {
                     assert!(
                         history.iter().any(
-                            |i| matches!(i, HistoryItem::ToolResult(r) if r.call_id == call.id)
+                            |i| matches!(i, ConversationItem::ToolResult(r) if r.call_id == call.id)
                         ),
                         "no result for {:?}",
                         call.id
@@ -949,14 +937,14 @@ mod tests {
         assert!(end.unwrap().1.is_some());
 
         let history = h.history();
-        assert!(matches!(history[0], HistoryItem::User { .. }));
+        assert!(matches!(history[0], ConversationItem::User { .. }));
         assert!(
-            matches!(&history[1], HistoryItem::Assistant { tool_calls, .. } if tool_calls.len() == 1)
+            matches!(&history[1], ConversationItem::Assistant { tool_calls, .. } if tool_calls.len() == 1)
         );
-        assert!(matches!(history[2], HistoryItem::ToolResult { .. }));
+        assert!(matches!(history[2], ConversationItem::ToolResult { .. }));
         assert!(matches!(
             &history[3],
-            HistoryItem::Assistant {
+            ConversationItem::Assistant {
                 content: Some(_),
                 ..
             }
@@ -1022,7 +1010,7 @@ mod tests {
         assert_eq!(message_events(&events).last().unwrap().1, "message:Hi!");
         assert_eq!(
             h.history().last(),
-            Some(&HistoryItem::assistant(Some("Hi!".into()), vec![]))
+            Some(&ConversationItem::assistant(Some("Hi!".into()), vec![]))
         );
     }
 
@@ -1056,7 +1044,7 @@ mod tests {
         assert!(matches!(result, Err(CoreError::Model(_))));
         let kinds: Vec<_> = message_events(&events).into_iter().map(|m| m.1).collect();
         assert_eq!(kinds, ["start", "delta:Hel"]);
-        assert_eq!(h.history(), [HistoryItem::user(None, "go")]);
+        assert_eq!(h.history(), [ConversationItem::user(None, "go")]);
     }
 
     #[tokio::test]
@@ -1174,14 +1162,14 @@ mod tests {
             .collect();
         assert_eq!(started, [(0, true), (1, true), (2, false)]);
 
-        // The reminder follows the forced call's ModelRequestStarted.
+        // The reminder is recorded right after the last tool request completes.
         let k = kinds(&events);
         let at = k.iter().position(|s| s == "req_start:2").unwrap();
-        assert_eq!(k[at + 1], "reminder");
+        assert_eq!(k[at - 1], "reminder");
+        assert_eq!(k[at - 2], "req_done:1");
         assert_eq!(k.iter().filter(|s| *s == "reminder").count(), 1);
-        match &events[at + 1].msg {
+        match &events[at - 1].msg {
             EventMsg::SystemReminder(r) => {
-                assert_eq!(r.iteration, 2);
                 assert_eq!(r.reminder, SystemReminder::ToolLimitReached);
             }
             _ => panic!(),
@@ -1208,20 +1196,20 @@ mod tests {
         let forced_history = request_history(&requests[2]);
         assert_eq!(
             forced_history.last(),
-            Some(&HistoryItem::system_reminder(
+            Some(&ConversationItem::system_reminder(
                 SystemReminder::ToolLimitReached
             ))
         );
         assert_eq!(forced_history.len(), 6);
-        // The reminder stays in the event projection and is filtered for later requests.
+        // The finished request consumed the reminder; it stays only in the log.
         let history = h.history();
-        assert_eq!(history.len(), 7);
-        assert!(history
+        assert_eq!(history.len(), 6);
+        assert!(!history
             .iter()
-            .any(|i| matches!(i, HistoryItem::SystemReminder(_))));
+            .any(|i| matches!(i, ConversationItem::SystemReminder(_))));
         assert!(matches!(
-            &history[6],
-            HistoryItem::Assistant { content: Some(c), .. } if c == "summary"
+            &history[5],
+            ConversationItem::Assistant { content: Some(c), .. } if c == "summary"
         ));
     }
 
@@ -1253,7 +1241,7 @@ mod tests {
         assert!(last_assistant.tool_calls.is_empty());
         assert!(matches!(
             h.history().last(),
-            Some(HistoryItem::Assistant { tool_calls, .. }) if tool_calls.is_empty()
+            Some(ConversationItem::Assistant { tool_calls, .. }) if tool_calls.is_empty()
         ));
     }
 
@@ -1321,7 +1309,7 @@ mod tests {
         assert_history_valid(&folded);
         let results = folded
             .iter()
-            .filter(|i| matches!(i, HistoryItem::ToolResult { .. }))
+            .filter(|i| matches!(i, ConversationItem::ToolResult { .. }))
             .count();
         assert_eq!(results, 2);
     }
@@ -1379,7 +1367,10 @@ mod tests {
         let (result, events) = t.turn("hello").await;
         result.unwrap();
         match (&t.h.history()[0], &t.h.history()[1]) {
-            (HistoryItem::EnvironmentContext(ctx), HistoryItem::User { content: msg, .. }) => {
+            (
+                ConversationItem::EnvironmentContext(ctx),
+                ConversationItem::User { content: msg, .. },
+            ) => {
                 assert_eq!(ctx, &available("2026-11-04", "Asia/Shanghai"));
                 assert_eq!(msg, "hello");
             }
@@ -1387,7 +1378,7 @@ mod tests {
         }
         let request = t.model.requests.lock().unwrap()[0].clone();
         let sent = request_history(&request);
-        assert!(matches!(&sent[0], HistoryItem::EnvironmentContext(_)));
+        assert!(matches!(&sent[0], ConversationItem::EnvironmentContext(_)));
 
         assert_eq!(
             kinds(&events),
@@ -1423,7 +1414,7 @@ mod tests {
         t.turn("c").await.0.unwrap();
         let entries = t.h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1], &available("2026-11-05", "Asia/Shanghai"));
+        assert_eq!(entries[1], available("2026-11-05", "Asia/Shanghai"));
     }
 
     #[tokio::test]
@@ -1446,7 +1437,7 @@ mod tests {
         t.turn("c").await.0.unwrap();
         let entries = t.h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1], &EnvironmentContext::Unavailable);
+        assert_eq!(entries[1], EnvironmentContext::Unavailable);
     }
 
     #[tokio::test]
@@ -1462,7 +1453,7 @@ mod tests {
         t.turn("c").await.0.unwrap();
         let entries = t.h.context_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1], &available("2026-11-04", "UTC"));
+        assert_eq!(entries[1], available("2026-11-04", "UTC"));
     }
 
     #[tokio::test]
@@ -1512,7 +1503,7 @@ mod tests {
         assert_eq!(end.result.tool_name, "miskeyed");
         assert!(h.history().iter().any(|i| matches!(
             i,
-            HistoryItem::ToolResult(r) if r.call_id == call.id && r.tool_name == "miskeyed"
+            ConversationItem::ToolResult(r) if r.call_id == call.id && r.tool_name == "miskeyed"
         )));
         assert_eq!(kinds(&events).last().unwrap(), "turn_complete");
     }
@@ -1548,51 +1539,350 @@ mod tests {
         assert!(!turn_complete_seen.load(Ordering::SeqCst));
     }
 
+    fn reminder_texts(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::SystemReminder(r) => Some(format!("{:?}", r.reminder)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn custom(text: &str) -> String {
+        format!("{:?}", SystemReminder::custom(text))
+    }
+
+    fn last_message_text(model: &ScriptedModel, request: usize) -> String {
+        let requests = model.requests.lock().unwrap();
+        let items = request_history(&requests[request]);
+        match items.last().unwrap() {
+            ConversationItem::SystemReminder(SystemReminder::Custom { text }) => text.clone(),
+            ConversationItem::SystemReminder(SystemReminder::ToolLimitReached) => {
+                "tool_limit_reached".into()
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn before_model_rewrites_request_without_emitting_events() {
+    async fn model_hooks_observe_request_and_response_without_emitting_events() {
         let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
         let trace = Arc::new(Mutex::new(Vec::new()));
-        let mut probe = Probe::new("prompt", trace);
-        probe.prompt_suffix = Some(" appended");
+        let mut probe = Probe::new("observe", trace);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        probe.seen_events = Some(seen.clone());
         h.agent = h.agent.with_middleware(Arc::new(probe));
 
         let (result, events, _) = h.turn("go").await;
         result.unwrap();
 
-        assert_eq!(
-            model.requests.lock().unwrap()[0].system_prompt.as_deref(),
-            Some(" appended")
-        );
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                [requests[0].events.clone()]
+            );
+        }
         let baseline = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
         let (_, baseline_events, _) = run(baseline, "go", &ThreadConfig::default()).await;
         assert_eq!(kinds(&events), kinds(&baseline_events));
     }
 
     #[tokio::test]
-    async fn after_model_rewrites_message_history_and_completion() {
+    async fn model_hooks_cannot_add_tool_calls() {
         let model = ScriptedModel::new(vec![resp(Some("hello"), vec![])]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        h.agent = h
+            .agent
+            .with_middleware(Arc::new(Probe::new("observe", trace)));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::ToolCallBegin(_))));
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.finish_reason == FinishReason::Completed
+                    && complete.last_agent_message.as_deref() == Some("hello")
+        ));
+    }
+
+    #[tokio::test]
+    async fn before_model_reminder_is_in_this_request_exactly_once() {
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
         let trace = Arc::new(Mutex::new(Vec::new()));
-        let mut probe = Probe::new("uppercase", trace);
-        probe.uppercase_response = true;
+        let mut probe = Probe::new("brief", trace);
+        probe.before_model_reminder = Some("be brief");
         h.agent = h.agent.with_middleware(Arc::new(probe));
 
         let (result, events, _) = h.turn("go").await;
         result.unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.msg,
-            EventMsg::AssistantMessage(message) if message.content.as_deref() == Some("HELLO")
-        )));
+
+        assert_eq!(reminder_texts(&events), [custom("be brief")]);
+        let requests = model.requests.lock().unwrap();
         assert_eq!(
-            h.history().last(),
-            Some(&HistoryItem::assistant(Some("HELLO".into()), Vec::new()))
+            requests[0]
+                .events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::SystemReminder(_)))
+                .count(),
+            1
         );
+        assert_eq!(
+            request_history(&requests[0]).last(),
+            Some(&ConversationItem::system_reminder(SystemReminder::custom(
+                "be brief"
+            )))
+        );
+        drop(requests);
+        // Consumed by the completed request.
+        assert_eq!(h.history().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn multiple_middlewares_record_reminders_in_registration_order() {
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut a = Probe::new("a", trace.clone());
+        a.before_model_reminder = Some("a");
+        let mut b = Probe::new("b", trace);
+        b.before_model_reminder = Some("b");
+        h.agent = h
+            .agent
+            .with_middlewares([Arc::new(a) as Arc<dyn Middleware>, Arc::new(b)]);
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        assert_eq!(reminder_texts(&events), [custom("a"), custom("b")]);
+        let requests = model.requests.lock().unwrap();
+        let items = request_history(&requests[0]);
+        assert_eq!(
+            items[items.len() - 2..],
+            [
+                ConversationItem::system_reminder(SystemReminder::custom("a")),
+                ConversationItem::system_reminder(SystemReminder::custom("b")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn after_model_reminder_reaches_the_next_request_after_the_assistant_message() {
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![tc("echo", serde_json::json!({"input":"x"}))]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("after", trace);
+        probe.after_model_reminder = Some("after model");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        let k = kinds(&events);
+        let assistant = k.iter().position(|s| s == "assistant:1").unwrap();
+        assert!(k.iter().position(|s| s == "reminder").unwrap() > assistant);
+        assert_eq!(last_message_text(&model, 1), "after model");
+    }
+
+    #[tokio::test]
+    async fn tool_hook_reminders_never_split_a_tool_call_and_reach_the_next_request() {
+        let model = ScriptedModel::new(vec![
+            resp(
+                None,
+                vec![
+                    tc("echo", serde_json::json!({"input":"1"})),
+                    tc("echo", serde_json::json!({"input":"2"})),
+                ],
+            ),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("tool", trace);
+        probe.before_tool_reminder = Some("before tool");
+        probe.after_tool_reminder = Some("after tool");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        let k = kinds(&events);
+        let mut open = false;
+        for kind in &k {
+            match kind.as_str() {
+                "tool_begin" => open = true,
+                "reminder" => assert!(!open, "reminder inside a tool call: {k:?}"),
+                kind if kind.starts_with("tool_end") => open = false,
+                _ => {}
+            }
+        }
+        assert_eq!(k.iter().filter(|s| *s == "reminder").count(), 4);
+        let last_tool_end = k.iter().rposition(|s| s.starts_with("tool_end")).unwrap();
+        assert!(
+            k.iter().position(|s| s == "reminder").unwrap()
+                > k.iter().position(|s| s == "assistant:2").unwrap()
+        );
+        assert!(k.iter().rposition(|s| s == "reminder").unwrap() > last_tool_end);
+
+        let requests = model.requests.lock().unwrap();
+        let items = request_history(&requests[1]);
         assert!(matches!(
-            &events.last().unwrap().msg,
-            EventMsg::TurnComplete(complete)
-                if complete.last_agent_message.as_deref() == Some("HELLO")
+            items[items.len() - 5],
+            ConversationItem::ToolResult(_)
         ));
+        assert_eq!(
+            items[items.len() - 4..]
+                .iter()
+                .filter(|item| matches!(item, ConversationItem::SystemReminder(_)))
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn after_step_reminder_before_done_is_recorded_before_token_count() {
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![]), resp(Some("again"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("step", trace);
+        probe.after_step_reminder = Some("wrap up");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+
+        let k = kinds(&events);
+        let reminder = k.iter().position(|s| s == "reminder").unwrap();
+        let token_count = k.iter().position(|s| s == "token_count").unwrap();
+        assert!(reminder < token_count);
+        // The next turn never sees it.
+        let (result, _, _) = h.turn("next").await;
+        result.unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert!(!request_history(&requests[1])
+            .iter()
+            .any(|item| matches!(item, ConversationItem::SystemReminder(_))));
+    }
+
+    #[tokio::test]
+    async fn after_turn_reminder_is_recorded_before_token_count() {
+        struct AfterTurnReminder;
+
+        #[async_trait]
+        impl Middleware for AfterTurnReminder {
+            async fn after_turn(&self, ctx: &HookCtx<'_>) -> Result<(), CoreError> {
+                ctx.remind(SystemReminder::custom("bye"));
+                Ok(())
+            }
+        }
+
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        h.agent = h.agent.with_middleware(Arc::new(AfterTurnReminder));
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        let k = kinds(&events);
+        assert_eq!(
+            k[k.len() - 3..],
+            ["reminder", "token_count", "turn_complete"]
+        );
+    }
+
+    #[tokio::test]
+    async fn before_turn_reminder_is_delivered_to_the_first_request() {
+        struct BeforeTurnReminder;
+
+        #[async_trait]
+        impl Middleware for BeforeTurnReminder {
+            async fn before_turn(
+                &self,
+                ctx: &HookCtx<'_>,
+                _initial_step: &mut TurnStep,
+            ) -> Result<(), CoreError> {
+                ctx.remind(SystemReminder::custom("start"));
+                Ok(())
+            }
+        }
+
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        h.agent = h.agent.with_middleware(Arc::new(BeforeTurnReminder));
+        let (result, events, _) = h.turn("go").await;
+        result.unwrap();
+        assert_eq!(reminder_texts(&events), [custom("start")]);
+        assert_eq!(last_message_text(&model, 0), "start");
+    }
+
+    #[tokio::test]
+    async fn reminder_record_failure_ends_turn_without_a_model_request() {
+        // turn_started, user, req_start, then the reminder append fails.
+        let store = Arc::new(FlakyStore::default());
+        store.fail_after(3);
+        let model = ScriptedModel::new(vec![resp(Some("ok"), vec![])]);
+        let mut h = Harness::with_store(
+            model.clone(),
+            Arc::new(FixedClock::new("2026-11-04", "UTC")),
+            ThreadConfig {
+                include_time_context: false,
+                ..Default::default()
+            },
+            store,
+        );
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("brief", trace);
+        probe.before_model_reminder = Some("be brief");
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(matches!(result, Err(CoreError::EventStore(_))));
+        assert!(model.requests.lock().unwrap().is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn zero_tool_budget_request_ends_with_the_limit_reminder() {
+        let model = ScriptedModel::new(vec![resp(Some("summary"), vec![])]);
+        let config = ThreadConfig {
+            max_tool_iterations: 0,
+            ..Default::default()
+        };
+        let (result, events, _) = run(model.clone(), "go", &config).await;
+        result.unwrap();
+        assert!(model.requests.lock().unwrap()[0].tools.is_empty());
+        assert_eq!(last_message_text(&model, 0), "tool_limit_reached");
+        let k = kinds(&events);
+        let reminder = k.iter().position(|s| s == "reminder").unwrap();
+        assert!(reminder < k.iter().position(|s| s == "req_start:0").unwrap());
+    }
+
+    #[tokio::test]
+    async fn limit_reminder_does_not_interleave_with_assistant_message_events() {
+        let echo = || tc("echo", serde_json::json!({"input": "x"}));
+        let model = ScriptedModel::new(vec![resp(None, vec![echo()]), resp(Some("end"), vec![])]);
+        let config = ThreadConfig {
+            max_tool_iterations: 1,
+            ..Default::default()
+        };
+        let (result, events, _) = run(model.clone(), "go", &config).await;
+        result.unwrap();
+        let k = kinds(&events);
+        let reminder = k.iter().position(|s| s == "reminder").unwrap();
+        assert_eq!(k[reminder - 1], "req_done:0");
+        assert_eq!(k[reminder + 1], "req_start:1");
+        assert_eq!(last_message_text(&model, 1), "tool_limit_reached");
     }
 
     #[tokio::test]
@@ -1657,7 +1947,7 @@ mod tests {
         )));
         assert!(request_history(&model.requests.lock().unwrap()[1])
             .iter()
-            .any(|item| matches!(item, HistoryItem::ToolResult(result) if result.output == "rewritten")));
+            .any(|item| matches!(item, ConversationItem::ToolResult(result) if result.output == "rewritten")));
     }
 
     #[tokio::test]
@@ -2038,10 +2328,7 @@ mod tests {
                 1,
             ),
             (
-                TurnStep::CallModel {
-                    allow_tools: true,
-                    reminder: None,
-                },
+                TurnStep::CallModel { allow_tools: true },
                 Some(resp(Some("answer"), vec![])),
                 2,
             ),
@@ -2077,7 +2364,7 @@ mod tests {
                 let history = request_history(&requests[1]);
                 assert!(matches!(
                     history.last(),
-                    Some(HistoryItem::Assistant { tool_calls, content: Some(text) })
+                    Some(ConversationItem::Assistant { tool_calls, content: Some(text) })
                         if tool_calls.is_empty() && text == "partial"
                 ));
             }
@@ -2089,10 +2376,7 @@ mod tests {
         let model = ScriptedModel::new(vec![resp(Some("answer"), vec![])]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
         let mut probe = Probe::new("reopen", Arc::new(Mutex::new(Vec::new())));
-        probe.step_override = Some(TurnStep::CallModel {
-            allow_tools: false,
-            reminder: None,
-        });
+        probe.step_override = Some(TurnStep::CallModel { allow_tools: false });
         h.agent = h.agent.with_middleware(Arc::new(probe));
 
         let (result, events, _) = h.turn("go").await;
@@ -2146,36 +2430,6 @@ mod tests {
             matches!(result, Err(CoreError::Internal(message)) if message.contains("pending tool batch"))
         );
         assert!(model.requests.lock().unwrap().is_empty());
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
-    }
-
-    #[tokio::test]
-    async fn model_hook_cannot_restore_tools_after_budget_is_exhausted() {
-        let model = ScriptedModel::new(vec![resp(Some("summary"), vec![])]);
-        let mut h = Harness::without_time(
-            model.clone(),
-            &ThreadConfig {
-                max_tool_iterations: 0,
-                ..Default::default()
-            },
-        );
-        h.agent = h.agent.with_middleware(Arc::new(ReenableTools));
-
-        let (result, events, _) = h.turn("go").await;
-
-        assert!(
-            matches!(result, Err(CoreError::Internal(message)) if message.contains("re-enabled tools"))
-        );
-        assert!(model.requests.lock().unwrap().is_empty());
-        assert!(events.iter().any(|event| matches!(
-            event.msg,
-            EventMsg::ModelRequestStarted(tapestry_protocol::ModelRequestStartedEvent {
-                allow_tools: false,
-                ..
-            })
-        )));
         assert!(!events
             .iter()
             .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
@@ -2421,10 +2675,7 @@ mod tests {
             Box::new(ScriptAgent::new(
                 bindings,
                 vec![
-                    TurnStep::CallModel {
-                        allow_tools: true,
-                        reminder: None,
-                    },
+                    TurnStep::CallModel { allow_tools: true },
                     TurnStep::CallModel {
                         allow_tools: false,
                         reminder: Some(SystemReminder::ToolLimitReached),
@@ -2488,14 +2739,8 @@ mod tests {
             Box::new(ScriptAgent::new(
                 bindings,
                 vec![
-                    TurnStep::CallModel {
-                        allow_tools: true,
-                        reminder: None,
-                    },
-                    TurnStep::CallModel {
-                        allow_tools: true,
-                        reminder: None,
-                    },
+                    TurnStep::CallModel { allow_tools: true },
+                    TurnStep::CallModel { allow_tools: true },
                     TurnStep::Done {
                         finish: FinishReason::Completed,
                         last_agent_message: Some("done".into()),
@@ -2564,10 +2809,7 @@ mod tests {
             Box::new(ScriptAgent::new(
                 bindings,
                 vec![
-                    TurnStep::CallModel {
-                        allow_tools: true,
-                        reminder: None,
-                    },
+                    TurnStep::CallModel { allow_tools: true },
                     TurnStep::Done {
                         finish: FinishReason::Completed,
                         last_agent_message: None,
@@ -2615,10 +2857,7 @@ mod tests {
             Box::new(ScriptAgent::new(
                 bindings,
                 vec![
-                    TurnStep::CallModel {
-                        allow_tools: true,
-                        reminder: None,
-                    },
+                    TurnStep::CallModel { allow_tools: true },
                     TurnStep::Done {
                         finish: FinishReason::Completed,
                         last_agent_message: Some("fresh".into()),

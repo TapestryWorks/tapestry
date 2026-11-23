@@ -6,7 +6,7 @@
 //!
 //! Every protocol type lives here, grouped by layer. Dependencies point one way:
 //! `common` (ids, environment context, system reminders) <- `tool` <- `model`
-//! (including `HistoryItem`), while `event` and `submission` build only on
+//! (including `ConversationItem`), while `event` and `submission` build only on
 //! `common` and `tool`.
 
 pub mod adapter;

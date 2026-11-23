@@ -53,7 +53,7 @@ The event log is the single source of truth for a thread. Conversation history i
         |                     |
         | apply (on success)  +--subscribe(after_log_position)--> EventSubscription (any number)
         v
- formatter::formatter_trait::HistoryProjection --history()--> model-facing formatter view
+ formatter::formatter_trait::ConversationProjection --messages()--> model-facing formatter view
  EventStore --read_after(thread, 0)--> ModelRequest.events (ordered immutable snapshot)
 ```
 
@@ -68,7 +68,7 @@ The event log is the single source of truth for a thread. Conversation history i
 
 ### Recorder
 
-`tapestry-core::recorder::Recorder` is the only writer. `record(msg)` appends a `NewEvent` (stamped with the current submission, turn and time) and, only after the append succeeds, applies the stored event to its live `formatter::formatter_trait::HistoryProjection`. The thread worker calls `begin_submission` for each submission (clearing the turn), and `run_turn` calls `set_turn` before `TurnStarted`.
+`tapestry-core::recorder::Recorder` is the only writer. `record(msg)` appends a `NewEvent` (stamped with the current submission, turn and time) and, only after the append succeeds, applies the stored event to its live `formatter::formatter_trait::ConversationProjection`. The thread worker calls `begin_submission` for each submission (clearing the turn), and `run_turn` calls `set_turn` before `TurnStarted`.
 
 ### EventStore and subscriptions
 
@@ -80,7 +80,7 @@ The event log is the single source of truth for a thread. Conversation history i
 
 ### History projection
 
-`HistoryProjection::apply` maps events to `HistoryItem`s: `UserMessage` → `User`, `AssistantMessage` → `Assistant`, `ToolCallEnd` → `ToolResult`, `EnvironmentContextUpdated` → `EnvironmentContext`, and `SystemReminder` → a structured reminder entry. Reminders remain in the complete projection; the default formatter filters those preceding the last user, assistant, or tool result when preparing messages. `AssistantMessageStart` and `AssistantMessageDelta` are ignored too: only the final `AssistantMessage` produces an entry, so the partial text of a message whose turn failed mid-stream never reaches history.
+`ConversationProjection::apply` maps events to `ConversationItem`s: `UserMessage` → `User`, `AssistantMessage` → `Assistant`, `ToolCallEnd` → `ToolResult`, `EnvironmentContextUpdated` → `EnvironmentContext`. `SystemReminder` events are held apart as pending reminders: the first following `ModelRequestCompleted` consumes them and a `TurnStarted` discards any unconsumed ones, so the position of a reminder in the log never decides whether it is delivered. `messages()` returns the items followed by the pending reminders in record order, so reminders always come last and never sit between a tool call and its result. `AssistantMessageStart` and `AssistantMessageDelta` are ignored: only the final `AssistantMessage` produces an entry, so the partial text of a message whose turn failed mid-stream never reaches the conversation.
 
 Repair happens only in the projection (no compensating events): when a turn is closed by `TurnAborted`, by an `Error` carrying a `turn_id`, by the next `TurnStarted`, or by the end of `fold`, every unanswered tool call of that turn receives a synthetic `failed` result. Synthetic results are inserted before still-valid trailing reminders. `fold` over the same log always produces the same history.
 
@@ -96,21 +96,21 @@ Repair happens only in the projection (no compensating events): when a turn is c
 | `codex_thread.rs` — thread lifecycle | `tapestry-core::thread` | `TapestryThread`, `ThreadBuilder`, `ThreadHandle` |
 | rollout recording | `tapestry-core::{store, recorder}` | `EventStore`, `InMemoryEventStore`, `EventSubscription`, `Recorder` |
 | `agent/` — turn policy & driver | `tapestry-core::agent` | `Agent` trait (`reasoning`/`acting`/`forward` + `*_with_hooks`; `ReactAgent` by default) + `AgentLoop::forward` (turn prologue) |
-| conversation history | `tapestry-protocol::model` (`HistoryItem`), `tapestry-core::formatter::formatter_trait` | `HistoryProjection` folds events and repairs unfinished turns |
+| conversation history | `tapestry-protocol::model` (`ConversationItem`), `tapestry-core::formatter::formatter_trait` | `ConversationProjection` folds events and repairs unfinished turns |
 | model invocation | `tapestry-protocol::model` (types), `tapestry-core::model` (behavior) | `ChatModel` (`complete`, `stream`), `ResponseModel` (`respond`, `stream`), shared `ModelStream`, and a mock for each trait |
 | provider integrations | `tapestry-core::model::genai` | Provider configuration, request/response mapping, and the genai-backed `GenaiModelClient` |
 | prompt rendering | `tapestry-core::formatter::utils` | `render_user`, `render_environment_context`, `render_system_reminder` |
 | config / session settings | `tapestry-core::config` + `ThreadSettings` | Sparse overrides |
 | tool execution | `tapestry-core::tool`, `tapestry-protocol::tool` | `Tool` trait, `ToolRegistry`; `ToolSpec`, `ToolCall`, `ToolResult` (protocol) |
 
-`formatter::Formatter` provides default event-stream folding into `HistoryItem`s via `HistoryProjection`, then default conversion into `genai::chat::ChatMessage`s; `format` invokes the two stages in order. Implementors can override either stage. The complete projection preserves structured reminders, while the default model-message view keeps only reminders after the latest user, assistant, or tool-result item; environment context does not expire them. Unfinished tool calls are repaired when a turn ends, with synthetic results placed before valid tail reminders. `OpenAiFormatter` uses these defaults. Shared text rendering helpers live in `formatter::utils`; `formatter::prompt` remains a compatibility re-export. `ModelRequest.events` is a complete ordered snapshot read from the event store after `ModelRequestStarted` and any reminder event have been appended. `GenaiModelClient` owns an `Arc<dyn Formatter>` and uses it for both streaming and non-streaming requests; OpenAI Chat and Responses models expose `with_formatter` and default to `OpenAiFormatter`. The public `model_request_to_chat_request` helper uses that default strategy. `model::chat_model` and `model::response_model` each group a trait with its mock and a concrete OpenAI client. `OpenAiChatModel` pins Chat Completions; `OpenAiResponseModel` pins the Responses API and sends the local event snapshot on each request. The traits share the normalized protocol types and `ModelStream`. `AgentLoop` uses `ChatModel`; the response interface is not wired into the agent loop. `ModelClient` and `MockModelClient` remain compatibility aliases for `ChatModel` and `MockChatModel`.
+`formatter::Formatter` provides default event-stream folding (`events_to_items`) into `ConversationItem`s via `ConversationProjection`, then default conversion into `genai::chat::ChatMessage`s; `format` invokes the two stages in order. Implementors can override either stage. The default message view maps every projected item in order, with no position-based reminder filtering. Unfinished tool calls are repaired when a turn ends; the synthetic results are appended to the items, ahead of the pending reminders. `OpenAiFormatter` uses these defaults. Shared text rendering helpers live in `formatter::utils`; `formatter::prompt` remains a compatibility re-export. `ModelRequest.events` is a complete ordered snapshot read from the event store after `ModelRequestStarted` and every reminder queued for this request have been appended. `GenaiModelClient` owns an `Arc<dyn Formatter>` and uses it for both streaming and non-streaming requests; OpenAI Chat and Responses models expose `with_formatter` and default to `OpenAiFormatter`. The public `model_request_to_chat_request` helper uses that default strategy. `model::chat_model` and `model::response_model` each group a trait with its mock and a concrete OpenAI client. `OpenAiChatModel` pins Chat Completions; `OpenAiResponseModel` pins the Responses API and sends the local event snapshot on each request. The traits share the normalized protocol types and `ModelStream`. `AgentLoop` uses `ChatModel`; the response interface is not wired into the agent loop. `ModelClient` and `MockModelClient` remain compatibility aliases for `ChatModel` and `MockChatModel`.
 
 ### Protocol layers
 
 `tapestry-protocol` owns Tapestry's protocol types and groups them by layer; external wire types and mappings live in their own adapter crates. `tapestry-core` keeps runtime behavior (traits, state machine, IO, policy, rendering).
 
 ```text
-common (incl. ids, context) <- tool <- model (incl. HistoryItem)
+common (incl. ids, context) <- tool <- model (incl. ConversationItem)
 submission, event -> { common, tool }
 adapter -> event
 ```
@@ -119,7 +119,7 @@ adapter -> event
 |-------|----------|
 | `common` | `TokenUsage`, `FinishReason`; `common::ids`: `SubmissionId`, `TurnId`, `ThreadId` (UUID), `ToolCallId` (opaque string); `common::context`: `EnvironmentContext`, `SystemReminder` |
 | `tool` | `ToolSpec`, `ToolCall`, `ToolCallStatus`, `ToolResult` |
-| `model` | `ModelRequest`, `ModelResponse`, `HistoryItem` (backend-neutral model protocol) |
+| `model` | `ModelRequest`, `ModelResponse`, `ConversationItem` (backend-neutral model protocol) |
 | `submission` | `Submission`, `Command`, `ThreadSettings` |
 | `event` | `Event`, `EventMsg` and the event payloads |
 | `adapter` | Protocol-independent event categories, filters and the `EventAdapter` conversion contract; depends on `event`, not on core or a target protocol |
@@ -143,11 +143,11 @@ adapter -> event
 
 The standard path is `AgentLoop::forward` -> `Agent::forward_with_hooks` -> `Agent::forward`. `forward_with_hooks` applies `before_turn`, calls the overridable `self.forward`, then applies `after_turn` and records exactly one `TokenCount`/`TurnComplete`. The default `forward` itself uses the hooked model and tool steps, so calling `forward` does not disable middleware. It returns an outcome and does not record turn completion.
 
-`TurnContext` is per-turn state: it carries the `Recorder`, `ThreadConfig`, `TurnId`, iteration, accumulated usage, initial plan, pending tool batch and open model iteration. A model iteration remains open while its complete tool batch executes; `ModelRequestCompleted(i)` is emitted only after the batch-level scheduling decision. Model calls are capped at `max_tool_iterations + 1`; the last default call has tools disabled and carries `ToolLimitReached`.
+`TurnContext` is per-turn state: it carries the `Recorder`, `ThreadConfig`, `TurnId`, iteration, accumulated usage, initial plan, pending tool batch, open model iteration and a reminder queue. `remind(reminder)` queues a `SystemReminder`; `flush_reminders()` records the queued reminders in order, one `SystemReminder` event each. A model iteration remains open while its complete tool batch executes; `ModelRequestCompleted(i)` is emitted only after the batch-level scheduling decision. Model calls are capped at `max_tool_iterations + 1`; the last default call has tools disabled and follows a `ToolLimitReached` reminder.
 
 A custom `forward` is responsible for preserving the same observable event and budget contracts for work it performs. `TurnContext::begin_model_iteration`, `set_model_usage` and `finish_model_iteration` provide the shared model-boundary and single-use accounting operations; pending batches likewise have explicit set/take methods.
 
-The model step builds a request snapshot, runs `before_model`, calls `self.reasoning(ctx, request)`, then runs `after_model`. The tool-batch wrapper calls `before_tool`, records `ToolCallBegin`, invokes `self.acting(call)` (or uses a `Skip` result), runs `after_tool`, re-keys the result to the original call and records `ToolCallEnd` for each call in order. A failure stops the batch; a failed/not-found/skipped result by itself does not.
+The model step records `ModelRequestStarted`, flushes queued reminders, reads the event snapshot, runs the read-only `before_model` hooks, flushes again and appends those reminders to the snapshot, calls `self.reasoning(ctx, request)`, then runs the read-only `after_model` hooks. The tool-batch wrapper calls `before_tool`, records `ToolCallBegin`, invokes `self.acting(call)` (or uses a `Skip` result), runs `after_tool`, re-keys the result to the original call and records `ToolCallEnd` for each call in order. A failure stops the batch; a failed/not-found/skipped result by itself does not.
 
 After each successful model step and each complete tool batch, the scheduler computes a default next step and runs `after_step` with a read-only `StepOutput` and that mutable plan. Later middleware can replace a nonterminal plan. `Done` is locked when it is the default or first selected; later middleware still observes it but cannot change the termination or its outcome. Invalid transitions are runtime errors. If the selected model step does not execute its returned tool calls, the complete assistant message omits those calls, preserves text and records a warning with the ignored count. This avoids dangling calls in history.
 
@@ -161,16 +161,27 @@ bind it to every agent the loop creates, and the constructors default to none.
 All hooks run in middleware registration order, including `after_turn`,
 `after_model`, `after_tool` and `after_step`. `HookCtx` provides the thread id,
 turn id, optional model/tool iteration and read-only thread configuration.
-Middleware cannot access the `Recorder`; hooks do not add events directly.
+Middleware cannot access the `Recorder`. The only way a hook affects the model
+context is `HookCtx::remind(reminder)`, which queues a system reminder that core
+records as a `SystemReminder` event at a safe point: never between an assistant
+message's start and final events, nor between one tool's `ToolCallBegin` and
+`ToolCallEnd`. Reminders from `before_turn`, `before_model` and the default
+scheduler are recorded before the next request's snapshot, so that request
+delivers them. Reminders written while a request is open (`after_model`, tool
+hooks, `after_step`) are recorded right after its `ModelRequestCompleted`
+(otherwise that event would consume them) and reach the next request; if the
+turn ends first they are recorded before `TokenCount` and expire at the next
+`TurnStarted`. `after_turn` reminders are also recorded before `TokenCount`.
 
 - `before_turn` runs after `TurnStarted`, optional environment context and
   `UserMessage`, and can change the initial step. Selecting `Done` skips model
   and tool work; `after_turn` still runs before completion events.
-- `before_model` runs after the request snapshot is assembled and before
-  `self.reasoning`; `after_model` runs after the final response, before the
-  default plan is computed. Rewritten content, tool calls and usage feed
-  scheduling and history. Already-recorded text deltas are not rolled back:
-  `after_model` and `after_step` are not streaming review barriers.
+- `before_model(&HookCtx, &[Event])` runs after the request snapshot is
+  assembled and before `self.reasoning`; `after_model(&HookCtx, &ModelResponse)`
+  runs after the final response, before the default plan is computed. Both are
+  read-only: they cannot rewrite the request, system prompt, tool specs or
+  response, and cannot add tool calls. Content review belongs in the model
+  implementation or a `reasoning` override.
 - `before_tool` runs before `ToolCallBegin`. It may rewrite arguments or return
   `ToolDecision::Skip(result)` to bypass execution and the remaining
   `before_tool` hooks for that call. The original call id and name are restored
@@ -183,6 +194,10 @@ Middleware cannot access the `Recorder`; hooks do not add events directly.
 - Any hook error stops the turn and propagates to the thread worker, which
   records the submission-scoped `Error`. `after_turn` is not called after a
   prior hook or runtime error.
+
+Migration from rewriting model hooks: use `HookCtx::remind` to influence the
+next request, `after_step` to change scheduling, and a `reasoning` override or
+the model implementation for output review.
 
 Migration from the former synchronous `next_step`/`on_model_output`/
 `on_tool_results` policy is to override `forward` for a genuinely custom flow,
@@ -207,12 +222,12 @@ when resuming a thread.
 
 - A model output without tool calls ends the turn with `finish_reason: completed`.
 - Tool calls are executed in order and their results fed back; unknown tools (`not_found`) and failures (`failed`) are results, not errors, and the loop continues.
-- The default `ReactAgent` runs tools for up to `max_tool_iterations` model calls, then makes one more call with no tools and records a `SystemReminder::ToolLimitReached` event before reading the event snapshot. The reminder remains in projected history and is formatted into that request; later user, assistant, or tool-result entries make it expire from the model-message view. The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted. Custom policies may choose different turn flows but cannot exceed `max_tool_iterations + 1` model calls.
+- The default `ReactAgent` runs tools for up to `max_tool_iterations` model calls, then makes one more call with no tools after queuing a `SystemReminder::ToolLimitReached`, recorded before that request's snapshot and formatted at the end of its messages. The completed request consumes the reminder; it stays only in the log. The turn ends with `finish_reason: exceed_max_iters`; tool calls in that final output are ignored and a `Warning` is emitted. Custom policies may choose different turn flows but cannot exceed `max_tool_iterations + 1` model calls.
 - On model failure the turn returns an error (the thread records `Error` with the turn's `turn_id`), and the projection gives every unanswered tool call a `failed` result so later requests stay valid. On an event-store failure, the thread attempts to record the submission error; an unavailable store may reject that error append too, and the open turn is repaired when the next turn starts or the log is folded.
 
 ### History and names
 
-History (`User{name}`, `Assistant{content, tool_calls}`, `ToolResult`, `EnvironmentContext`, `SystemReminder`) is the `HistoryProjection` of the event log and persists across turns. `ModelRequest` carries `system_prompt`, the complete ordered `events` snapshot, `tools` (empty when tools are disallowed) and `iteration`.
+History (`User{name}`, `Assistant{content, tool_calls}`, `ToolResult`, `EnvironmentContext`, `SystemReminder`) is the `ConversationProjection` of the event log and persists across turns; unconsumed reminders are appended last. `ModelRequest` carries `system_prompt`, the complete ordered `events` snapshot, `tools` (empty when tools are disallowed) and `iteration`.
 
 - `Command::StartTurn.name` becomes `User.name`; it must be non-empty and contain no line breaks, otherwise the thread emits `Error` and history is unchanged.
 - Adapters render user messages with `prompt::render_user` as `"{name}: {content}"` (a text prefix, not a provider `name` field); consecutive user messages are not merged.
@@ -221,12 +236,12 @@ History (`User{name}`, `Assistant{content, tool_calls}`, `ToolResult`, `Environm
 
 ### Time context
 
-Models have no clock, so `run_turn` records an `EnvironmentContextUpdated` event (projected to `HistoryItem::EnvironmentContext`) before the turn's user message when the date or time zone differs from the baseline (design follows Codex `<environment_context>`):
+Models have no clock, so `run_turn` records an `EnvironmentContextUpdated` event (projected to `ConversationItem::EnvironmentContext`) before the turn's user message when the date or time zone differs from the baseline (design follows Codex `<environment_context>`):
 
 - `EnvironmentContext` is `Available{date, timezone}` or `Unavailable`; every entry is a complete snapshot, and `prompt::render_environment_context` renders it as `<environment_context>` text for the model. The baseline is the last such entry in history (none means nothing sent), so no session state is kept. Same-day turns send nothing; detection happens once per turn, not per model call.
 - Time comes from an injected `Arc<dyn Clock>` (`SystemClock` by default: local date plus IANA zone, falling back to a UTC offset; `FixedClock` for tests).
 - `ThreadSettings.include_time_context` (default on) disables it. Disabling after a send, or a clock failure, appends `<current_date status="unavailable" />` once; a clock failure never fails the turn. Recovery re-sends the full context.
-- It differs from `SystemReminder`: both are projected from events, but time context is a baseline snapshot while reminders are filtered by the model-message ordering rule.
+- It differs from `SystemReminder`: both are projected from events, but time context is a baseline snapshot while reminders are consumed by the next completed model request.
 - History rewrites (compaction, rollback, restore) need no reset: the baseline follows whatever history remains, so a rewrite that drops the entries re-sends in full and one that keeps them does not.
 - Timestamps live on the event envelope (`timestamp_ms`), not on items. Never derive the baseline from envelope timestamps.
 
@@ -237,7 +252,7 @@ TurnStarted
 [EnvironmentContextUpdated]
 UserMessage
   ModelRequestStarted(i)
-    [SystemReminder]                 -- only on the forced final call
+    [SystemReminder]*                -- queued reminders; recorded before the request snapshot, or after the previous ModelRequestCompleted
     [AssistantMessageStart
       AssistantMessageDelta*         -- streamed text, same message_id
       AssistantMessage]              -- omitted entirely for an empty output
@@ -270,7 +285,7 @@ sequenceDiagram
     Agent->>MW: before_turn(initial_step)
     loop until Done
         alt CallModel
-            Agent->>MW: before_model(request)
+            Agent->>MW: before_model(events)
             Agent->>Model: reasoning(ModelRequest)
             Agent->>MW: after_model(response)
             Agent->>MW: after_step(Model response, next_step)
@@ -324,7 +339,7 @@ sequenceDiagram
 ## Testing strategy
 
 - **Protocol:** serde round-trip unit tests for every public request/event type
-- **Core:** `TurnContext` tests cover per-turn state and single-use tool batches; `AgentLoop` tests cover overridden reasoning/tool/forward methods, middleware registration order, `after_step` scheduling and early finish, tool-budget and event invariants, and scripted model streams; `InMemoryEventStore` and `HistoryProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word)
+- **Core:** `TurnContext` tests cover per-turn state and single-use tool batches; `AgentLoop` tests cover overridden reasoning/tool/forward methods, middleware registration order, `after_step` scheduling and early finish, tool-budget and event invariants, and scripted model streams; `InMemoryEventStore` and `ConversationProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word)
 - **Integration:** `TapestryThread` end-to-end tests via `ThreadHandle` and `EventSubscription`, including resume from a stored log
 
 Run locally:

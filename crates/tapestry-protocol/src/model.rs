@@ -9,7 +9,7 @@ use crate::tool::{ToolCall, ToolResult, ToolSpec};
 /// One entry of the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum HistoryItem {
+pub enum ConversationItem {
     /// Input from a user-side speaker; `name` identifies the speaker.
     User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,11 +25,11 @@ pub enum HistoryItem {
     },
     ToolResult(ToolResult),
     EnvironmentContext(EnvironmentContext),
-    /// Projected from a recorded reminder event and filtered when preparing model messages.
+    /// Projected from a recorded reminder event that no model request has consumed yet.
     SystemReminder(SystemReminder),
 }
 
-impl HistoryItem {
+impl ConversationItem {
     pub fn user(name: Option<String>, content: impl Into<String>) -> Self {
         Self::User {
             name,
@@ -49,13 +49,13 @@ impl HistoryItem {
     }
 }
 
-impl From<ToolResult> for HistoryItem {
+impl From<ToolResult> for ConversationItem {
     fn from(result: ToolResult) -> Self {
         Self::ToolResult(result)
     }
 }
 
-impl From<EnvironmentContext> for HistoryItem {
+impl From<EnvironmentContext> for ConversationItem {
     fn from(context: EnvironmentContext) -> Self {
         Self::EnvironmentContext(context)
     }
@@ -119,41 +119,42 @@ mod tests {
     fn items_round_trip() {
         let call = call();
         let items = vec![
-            HistoryItem::user(Some("alice".into()), "hi"),
-            HistoryItem::assistant(None, vec![call.clone()]),
+            ConversationItem::user(Some("alice".into()), "hi"),
+            ConversationItem::assistant(None, vec![call.clone()]),
             ToolResult::completed(&call, "x").into(),
-            HistoryItem::assistant(Some("done".into()), vec![]),
+            ConversationItem::assistant(Some("done".into()), vec![]),
             EnvironmentContext::Available {
                 date: "2026-11-05".into(),
                 timezone: "UTC".into(),
             }
             .into(),
             EnvironmentContext::Unavailable.into(),
-            HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
-            HistoryItem::system_reminder(SystemReminder::custom("be brief")),
+            ConversationItem::system_reminder(SystemReminder::ToolLimitReached),
+            ConversationItem::system_reminder(SystemReminder::custom("be brief")),
         ];
         let text = serde_json::to_string(&items).unwrap();
-        let back: Vec<HistoryItem> = serde_json::from_str(&text).unwrap();
+        let back: Vec<ConversationItem> = serde_json::from_str(&text).unwrap();
         assert_eq!(back, items);
     }
 
     #[test]
     fn wire_format_is_tagged_and_omits_empty_fields() {
-        let user = serde_json::to_value(HistoryItem::user(None, "hi")).unwrap();
+        let user = serde_json::to_value(ConversationItem::user(None, "hi")).unwrap();
         assert_eq!(user, json!({"type": "user", "content": "hi"}));
 
         let assistant =
-            serde_json::to_value(HistoryItem::assistant(Some("ok".into()), vec![])).unwrap();
+            serde_json::to_value(ConversationItem::assistant(Some("ok".into()), vec![])).unwrap();
         assert_eq!(assistant, json!({"type": "assistant", "content": "ok"}));
 
-        let parsed: HistoryItem = serde_json::from_value(json!({"type": "assistant"})).unwrap();
-        assert_eq!(parsed, HistoryItem::assistant(None, vec![]));
+        let parsed: ConversationItem =
+            serde_json::from_value(json!({"type": "assistant"})).unwrap();
+        assert_eq!(parsed, ConversationItem::assistant(None, vec![]));
     }
 
     #[test]
     fn tool_result_wire_format_is_flat() {
         let value =
-            serde_json::to_value(HistoryItem::from(ToolResult::not_found(&call()))).unwrap();
+            serde_json::to_value(ConversationItem::from(ToolResult::not_found(&call()))).unwrap();
         assert_eq!(
             value,
             json!({
@@ -168,7 +169,7 @@ mod tests {
 
     #[test]
     fn environment_context_wire_format() {
-        let available = HistoryItem::from(EnvironmentContext::Available {
+        let available = ConversationItem::from(EnvironmentContext::Available {
             date: "2026-11-05".into(),
             timezone: "Asia/Shanghai".into(),
         });
@@ -182,7 +183,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(HistoryItem::from(EnvironmentContext::Unavailable)).unwrap(),
+            serde_json::to_value(ConversationItem::from(EnvironmentContext::Unavailable)).unwrap(),
             json!({"type": "environment_context", "state": "unavailable"})
         );
     }
@@ -190,7 +191,7 @@ mod tests {
     #[test]
     fn system_reminder_wire_format() {
         assert_eq!(
-            serde_json::to_value(HistoryItem::system_reminder(
+            serde_json::to_value(ConversationItem::system_reminder(
                 SystemReminder::ToolLimitReached
             ))
             .unwrap(),
@@ -201,7 +202,7 @@ mod tests {
     #[test]
     fn custom_system_reminder_wire_format() {
         assert_eq!(
-            serde_json::to_value(HistoryItem::system_reminder(SystemReminder::custom(
+            serde_json::to_value(ConversationItem::system_reminder(SystemReminder::custom(
                 "be brief"
             )))
             .unwrap(),
@@ -291,7 +292,6 @@ mod tests {
                     turn_id: Some(turn_id),
                     timestamp_ms: 103,
                     msg: EventMsg::SystemReminder(SystemReminderEvent {
-                        iteration: 2,
                         reminder: SystemReminder::ToolLimitReached,
                     }),
                 },

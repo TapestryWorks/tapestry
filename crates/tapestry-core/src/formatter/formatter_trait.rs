@@ -1,31 +1,31 @@
-//! Conversation history as a projection of the event log.
+//! Conversation as a projection of the event log.
 //!
-//! History is never written directly: [`HistoryProjection::apply`] folds each
-//! appended event, so a thread's live history and a fresh fold of its log are
-//! always equal.
+//! The conversation is never written directly: [`ConversationProjection::apply`]
+//! folds each appended event, so a thread's live projection and a fresh fold of
+//! its log are always equal.
 
-use tapestry_protocol::{Event, EventMsg, HistoryItem, ToolResult, TurnId};
+use tapestry_protocol::{ConversationItem, Event, EventMsg, SystemReminder, ToolResult, TurnId};
 
 use crate::formatter::prompt::{render_environment_context, render_system_reminder, render_user};
 use genai::chat::{
     ChatMessage, ContentPart, MessageContent, ToolCall as GenaiToolCall, ToolResponse,
 };
 
-/// Convert one event into its projected history entry, if any.
-pub fn event_to_history_item(event: &Event) -> Option<HistoryItem> {
+/// Convert one event into its projected conversation item, if any.
+pub fn event_to_item(event: &Event) -> Option<ConversationItem> {
     match &event.msg {
-        EventMsg::UserMessage(message) => Some(HistoryItem::user(
+        EventMsg::UserMessage(message) => Some(ConversationItem::user(
             message.name.clone(),
             message.content.clone(),
         )),
-        EventMsg::AssistantMessage(message) => Some(HistoryItem::assistant(
+        EventMsg::AssistantMessage(message) => Some(ConversationItem::assistant(
             message.content.clone(),
             message.tool_calls.clone(),
         )),
         EventMsg::ToolCallEnd(end) => Some(end.result.clone().into()),
         EventMsg::EnvironmentContextUpdated(update) => Some(update.context.clone().into()),
         EventMsg::SystemReminder(reminder) => {
-            Some(HistoryItem::system_reminder(reminder.reminder.clone()))
+            Some(ConversationItem::system_reminder(reminder.reminder.clone()))
         }
         EventMsg::Warning(_)
         | EventMsg::Error(_)
@@ -43,12 +43,14 @@ pub fn event_to_history_item(event: &Event) -> Option<HistoryItem> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HistoryProjection {
-    items: Vec<HistoryItem>,
+pub struct ConversationProjection {
+    items: Vec<ConversationItem>,
+    /// Reminders no completed model request has consumed yet.
+    reminders: Vec<SystemReminder>,
     open_turn: Option<TurnId>,
 }
 
-impl HistoryProjection {
+impl ConversationProjection {
     pub fn new() -> Self {
         Self::default()
     }
@@ -63,23 +65,39 @@ impl HistoryProjection {
         projection
     }
 
-    pub fn history(&self) -> &[HistoryItem] {
-        &self.items
+    /// The conversation so far; valid reminders always come last.
+    pub fn messages(&self) -> Vec<ConversationItem> {
+        self.items
+            .iter()
+            .cloned()
+            .chain(
+                self.reminders
+                    .iter()
+                    .cloned()
+                    .map(ConversationItem::system_reminder),
+            )
+            .collect()
     }
 
     pub fn apply(&mut self, event: &Event) {
         match &event.msg {
             EventMsg::TurnStarted(_) => {
                 self.close_turn();
+                self.reminders.clear();
                 self.open_turn = event.turn_id;
             }
             EventMsg::TurnComplete(_) => self.open_turn = None,
             EventMsg::TurnAborted(_) => self.close_turn(),
             EventMsg::Error(_) if event.turn_id.is_some() => self.close_turn(),
+            EventMsg::ModelRequestCompleted(_) => self.reminders.clear(),
+            EventMsg::SystemReminder(reminder) => {
+                self.reminders.push(reminder.reminder.clone());
+                return;
+            }
             _ => {}
         }
 
-        if let Some(item) = event_to_history_item(event) {
+        if let Some(item) = event_to_item(event) {
             self.items.push(item);
         }
     }
@@ -94,100 +112,64 @@ impl HistoryProjection {
 }
 
 /// Append a `failed` result for every trailing tool call that has none, so the
-/// history stays valid for later model requests.
-fn fill_missing_tool_results(history: &mut Vec<HistoryItem>) {
-    let Some(assistant_idx) = history
+/// conversation stays valid for later model requests.
+fn fill_missing_tool_results(items: &mut Vec<ConversationItem>) {
+    let Some(assistant_idx) = items
         .iter()
-        .rposition(|item| matches!(item, HistoryItem::Assistant { .. }))
+        .rposition(|item| matches!(item, ConversationItem::Assistant { .. }))
     else {
         return;
     };
-    let HistoryItem::Assistant { tool_calls, .. } = &history[assistant_idx] else {
+    let ConversationItem::Assistant { tool_calls, .. } = &items[assistant_idx] else {
         return;
     };
 
-    let missing: Vec<HistoryItem> = tool_calls
+    let missing: Vec<ConversationItem> = tool_calls
         .iter()
         .filter(|call| {
-            !history[assistant_idx + 1..].iter().any(
-                |item| matches!(item, HistoryItem::ToolResult(result) if result.call_id == call.id),
+            !items[assistant_idx + 1..].iter().any(
+                |item| matches!(item, ConversationItem::ToolResult(result) if result.call_id == call.id),
             )
         })
-        .map(|call| HistoryItem::from(ToolResult::failed(call, "tool call was not completed")))
+        .map(|call| ConversationItem::from(ToolResult::failed(call, "tool call was not completed")))
         .collect();
-    if missing.is_empty() {
-        return;
-    }
-
-    let insert_at = history[assistant_idx + 1..]
-        .iter()
-        .rposition(|item| {
-            matches!(
-                item,
-                HistoryItem::User { .. }
-                    | HistoryItem::Assistant { .. }
-                    | HistoryItem::ToolResult(_)
-            )
-        })
-        .map_or(assistant_idx + 1, |index| assistant_idx + 2 + index);
-    history.splice(insert_at..insert_at, missing);
+    items.extend(missing);
 }
 
-/// Formatter for ordered event streams and normalized model history.
+/// Formatter for ordered event streams and normalized conversation items.
 ///
-/// The defaults fold events into the current conversation history and map
-/// history entries into genai chat messages. The complete projected history
-/// retains reminders; the default message view filters reminders older than
-/// the last user, assistant, or tool-result item. Override either stage when a
-/// formatter needs custom projection or provider-specific conversion.
+/// The defaults fold events into the current conversation (valid reminders
+/// last) and map every item into a genai chat message. Override either stage
+/// when a formatter needs custom projection or provider-specific conversion.
 pub trait Formatter: Send + Sync {
-    /// Fold events into persistent history, repairing unfinished turns.
-    fn events_to_history_items(&self, events: &[Event]) -> Vec<HistoryItem> {
-        HistoryProjection::fold(events).history().to_vec()
+    /// Fold events into conversation items, repairing unfinished turns.
+    fn events_to_items(&self, events: &[Event]) -> Vec<ConversationItem> {
+        ConversationProjection::fold(events).messages()
     }
 
-    /// Convert the model-facing view of history items into genai chat messages.
-    ///
-    /// Reminders before the last user, assistant, or tool result are retained
-    /// in projection but omitted from this sent view.
-    fn history_items_to_messages(&self, items: &[HistoryItem]) -> Vec<ChatMessage> {
-        let last_conversation_item = items.iter().rposition(|item| {
-            matches!(
-                item,
-                HistoryItem::User { .. }
-                    | HistoryItem::Assistant { .. }
-                    | HistoryItem::ToolResult(_)
-            )
-        });
-        items
-            .iter()
-            .enumerate()
-            .filter(|(index, item)| {
-                !matches!(item, HistoryItem::SystemReminder(_))
-                    || last_conversation_item.is_none_or(|last| *index > last)
-            })
-            .map(|(_, item)| history_item_to_message(item))
-            .collect()
+    /// Convert conversation items into genai chat messages, in order.
+    fn history_items_to_messages(&self, items: &[ConversationItem]) -> Vec<ChatMessage> {
+        items.iter().map(history_item_to_message).collect()
     }
 
     /// Convert an event stream into genai chat messages using the defaults.
     fn format(&self, events: &[Event]) -> Vec<ChatMessage> {
-        self.history_items_to_messages(&self.events_to_history_items(events))
+        self.history_items_to_messages(&self.events_to_items(events))
     }
 }
 
-pub(crate) fn history_item_to_message(item: &HistoryItem) -> ChatMessage {
+pub(crate) fn history_item_to_message(item: &ConversationItem) -> ChatMessage {
     match item {
-        HistoryItem::User { name, content } => {
+        ConversationItem::User { name, content } => {
             ChatMessage::user(render_user(name.as_deref(), content))
         }
-        HistoryItem::EnvironmentContext(context) => {
+        ConversationItem::EnvironmentContext(context) => {
             ChatMessage::user(render_environment_context(context))
         }
-        HistoryItem::SystemReminder(reminder) => {
+        ConversationItem::SystemReminder(reminder) => {
             ChatMessage::user(render_system_reminder(reminder))
         }
-        HistoryItem::Assistant {
+        ConversationItem::Assistant {
             content,
             tool_calls,
         } => {
@@ -208,7 +190,7 @@ pub(crate) fn history_item_to_message(item: &HistoryItem) -> ChatMessage {
             }));
             ChatMessage::assistant(MessageContent::from_parts(parts))
         }
-        HistoryItem::ToolResult(result) => ChatMessage::from(
+        ConversationItem::ToolResult(result) => ChatMessage::from(
             ToolResponse::new(result.call_id.as_str().to_string(), result.output.clone())
                 .with_fn_name(result.tool_name.clone()),
         ),
@@ -222,10 +204,10 @@ mod tests {
     use serde_json::Value;
     use tapestry_protocol::{
         AssistantMessageDeltaEvent, AssistantMessageEvent, AssistantMessageStartEvent,
-        EnvironmentContext, EnvironmentContextUpdatedEvent, ErrorEvent, MessageId, SubmissionId,
-        SystemReminder, SystemReminderEvent, ThreadId, ToolCall, ToolCallEndEvent, ToolCallId,
-        ToolCallStatus, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
-        UserMessageEvent,
+        EnvironmentContext, EnvironmentContextUpdatedEvent, ErrorEvent, MessageId,
+        ModelRequestCompletedEvent, ModelRequestStartedEvent, SubmissionId, SystemReminder,
+        SystemReminderEvent, ThreadId, ToolCall, ToolCallEndEvent, ToolCallId, ToolCallStatus,
+        TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
     };
 
     use super::*;
@@ -301,8 +283,8 @@ mod tests {
             }))
         }
 
-        fn fold(&self) -> Vec<HistoryItem> {
-            HistoryProjection::fold(&self.events).history().to_vec()
+        fn fold(&self) -> Vec<ConversationItem> {
+            ConversationProjection::fold(&self.events).messages()
         }
     }
 
@@ -325,15 +307,15 @@ mod tests {
             .expect("message has text")
     }
 
-    fn failed_result_for(history: &[HistoryItem], call: &ToolCall) -> bool {
+    fn failed_result_for(history: &[ConversationItem], call: &ToolCall) -> bool {
         history.iter().any(|i| {
-            matches!(i, HistoryItem::ToolResult(r)
+            matches!(i, ConversationItem::ToolResult(r)
                 if r.call_id == call.id && r.status == ToolCallStatus::Failed)
         })
     }
 
     #[test]
-    fn event_to_history_item_filters_non_history_events() {
+    fn event_to_item_filters_non_history_events() {
         let turn = TurnId::new();
         let event = |msg: EventMsg| Event {
             id: SubmissionId::new(),
@@ -344,30 +326,27 @@ mod tests {
             msg,
         };
         assert_eq!(
-            event_to_history_item(&event(EventMsg::UserMessage(UserMessageEvent {
+            event_to_item(&event(EventMsg::UserMessage(UserMessageEvent {
                 name: Some("alice".into()),
                 content: "hi".into(),
             }))),
-            Some(HistoryItem::user(Some("alice".into()), "hi"))
+            Some(ConversationItem::user(Some("alice".into()), "hi"))
         );
         assert_eq!(
-            event_to_history_item(&event(EventMsg::SystemReminder(SystemReminderEvent {
-                iteration: 0,
+            event_to_item(&event(EventMsg::SystemReminder(SystemReminderEvent {
                 reminder: SystemReminder::ToolLimitReached,
             }))),
-            Some(HistoryItem::system_reminder(
+            Some(ConversationItem::system_reminder(
                 SystemReminder::ToolLimitReached
             ))
         );
-        assert!(
-            event_to_history_item(&event(EventMsg::AssistantMessageDelta(
-                AssistantMessageDeltaEvent {
-                    message_id: MessageId::new(),
-                    delta: "x".into(),
-                }
-            )))
-            .is_none()
-        );
+        assert!(event_to_item(&event(EventMsg::AssistantMessageDelta(
+            AssistantMessageDeltaEvent {
+                message_id: MessageId::new(),
+                delta: "x".into(),
+            }
+        )))
+        .is_none());
     }
 
     #[test]
@@ -397,33 +376,179 @@ mod tests {
             log.fold(),
             vec![
                 context.into(),
-                HistoryItem::user(Some("alice".into()), "hi"),
-                HistoryItem::assistant(None, vec![a.clone()]),
+                ConversationItem::user(Some("alice".into()), "hi"),
+                ConversationItem::assistant(None, vec![a.clone()]),
                 ToolResult::completed(&a, "ok").into(),
-                HistoryItem::assistant(Some("done".into()), vec![]),
+                ConversationItem::assistant(Some("done".into()), vec![]),
+            ]
+        );
+    }
+
+    fn reminder(text: &str) -> EventMsg {
+        EventMsg::SystemReminder(SystemReminderEvent {
+            reminder: SystemReminder::custom(text),
+        })
+    }
+
+    fn reminder_item(text: &str) -> ConversationItem {
+        ConversationItem::system_reminder(SystemReminder::custom(text))
+    }
+
+    fn request_started() -> EventMsg {
+        EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
+            iteration: 0,
+            allow_tools: true,
+        })
+    }
+
+    fn request_completed() -> EventMsg {
+        EventMsg::ModelRequestCompleted(ModelRequestCompletedEvent {
+            iteration: 0,
+            usage: Default::default(),
+        })
+    }
+
+    /// Incremental `apply` must agree with `fold` for every prefix of `log`.
+    fn assert_live_equals_fold(log: &Log) {
+        let mut live = ConversationProjection::new();
+        for (index, event) in log.events.iter().enumerate() {
+            live.apply(event);
+            let mut closed = live.clone();
+            closed.close_turn();
+            assert_eq!(
+                closed,
+                ConversationProjection::fold(&log.events[..=index]),
+                "prefix {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn unconsumed_reminder_is_projected_last() {
+        let mut log = Log::new();
+        log.start("hi").push(request_started()).push(reminder("r"));
+        assert_eq!(
+            log.fold(),
+            vec![ConversationItem::user(None, "hi"), reminder_item("r")]
+        );
+    }
+
+    #[test]
+    fn reminder_before_tool_result_is_still_delivered_after_it() {
+        let a = call();
+        let mut log = Log::new();
+        log.start("go")
+            .push(request_started())
+            .assistant(None, std::slice::from_ref(&a))
+            .push(reminder("r"))
+            .tool_end(&a);
+        assert_eq!(
+            log.fold(),
+            vec![
+                ConversationItem::user(None, "go"),
+                ConversationItem::assistant(None, vec![a.clone()]),
+                ToolResult::completed(&a, "ok").into(),
+                reminder_item("r"),
             ]
         );
     }
 
     #[test]
-    fn system_reminder_is_preserved_in_projection_and_streaming_delta_is_not() {
+    fn completed_request_consumes_reminders_even_without_output() {
         let mut log = Log::new();
         log.start("hi")
-            .push(EventMsg::SystemReminder(SystemReminderEvent {
-                iteration: 0,
-                reminder: SystemReminder::ToolLimitReached,
-            }))
-            .assistant(Some("ok"), &[])
-            .complete();
-        let history = log.fold();
+            .push(request_started())
+            .push(reminder("r"))
+            .push(request_completed());
+        assert_eq!(log.fold(), vec![ConversationItem::user(None, "hi")]);
+    }
+
+    #[test]
+    fn reminders_keep_order_and_are_consumed_together() {
+        let mut log = Log::new();
+        log.start("hi")
+            .push(request_started())
+            .push(reminder("a"))
+            .push(reminder("b"));
         assert_eq!(
-            history,
+            log.fold(),
             vec![
-                HistoryItem::user(None, "hi"),
-                HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
-                HistoryItem::assistant(Some("ok".into()), vec![]),
+                ConversationItem::user(None, "hi"),
+                reminder_item("a"),
+                reminder_item("b")
             ]
         );
+        log.push(request_completed());
+        assert_eq!(log.fold(), vec![ConversationItem::user(None, "hi")]);
+    }
+
+    #[test]
+    fn reminder_recorded_after_a_completed_request_survives_until_the_next_one() {
+        let mut log = Log::new();
+        log.start("hi")
+            .push(request_started())
+            .push(request_completed())
+            .push(reminder("late"));
+        assert_eq!(
+            log.fold(),
+            vec![ConversationItem::user(None, "hi"), reminder_item("late")]
+        );
+    }
+
+    #[test]
+    fn new_turn_discards_unconsumed_reminders() {
+        let mut log = Log::new();
+        log.start("one")
+            .push(request_started())
+            .push(reminder("stale"))
+            .push(EventMsg::Error(ErrorEvent {
+                message: "down".into(),
+            }));
+        log.start("two");
+        assert_eq!(
+            log.fold(),
+            vec![
+                ConversationItem::user(None, "one"),
+                ConversationItem::user(None, "two")
+            ]
+        );
+    }
+
+    #[test]
+    fn reminders_follow_synthesized_failed_results() {
+        let a = call();
+        let mut log = Log::new();
+        log.start("go")
+            .assistant(None, std::slice::from_ref(&a))
+            .push(reminder("r"));
+        let items = log.fold();
+        assert_eq!(items.len(), 4);
+        assert!(failed_result_for(&items, &a));
+        assert_eq!(items[3], reminder_item("r"));
+    }
+
+    #[test]
+    fn incremental_apply_matches_fold_with_reminders() {
+        let a = call();
+        let mut log = Log::new();
+        log.start("go")
+            .push(request_started())
+            .push(reminder("x"))
+            .assistant(None, std::slice::from_ref(&a))
+            .push(reminder("y"))
+            .tool_end(&a)
+            .push(request_completed())
+            .push(reminder("z"))
+            .push(request_started())
+            .assistant(Some("done"), &[])
+            .push(request_completed())
+            .complete();
+        assert_live_equals_fold(&log);
+        log.start("next")
+            .push(request_started())
+            .assistant(None, std::slice::from_ref(&a))
+            .push(reminder("w"));
+        assert_live_equals_fold(&log);
     }
 
     #[test]
@@ -434,7 +559,7 @@ mod tests {
             .push(EventMsg::Error(ErrorEvent {
                 message: "down".into(),
             }));
-        assert_eq!(log.fold(), vec![HistoryItem::user(None, "go")]);
+        assert_eq!(log.fold(), vec![ConversationItem::user(None, "go")]);
     }
 
     #[test]
@@ -451,8 +576,8 @@ mod tests {
         assert_eq!(
             log.fold(),
             vec![
-                HistoryItem::user(None, "go"),
-                HistoryItem::assistant(Some("abc!".into()), vec![]),
+                ConversationItem::user(None, "go"),
+                ConversationItem::assistant(Some("abc!".into()), vec![]),
             ]
         );
     }
@@ -473,11 +598,11 @@ mod tests {
         assert!(!failed_result_for(&history, &a));
 
         // Applying incrementally gives the same result as folding.
-        let mut live = HistoryProjection::new();
+        let mut live = ConversationProjection::new();
         for event in &log.events {
             live.apply(event);
         }
-        assert_eq!(live.history(), history.as_slice());
+        assert_eq!(live.messages(), history);
     }
 
     #[test]
@@ -494,11 +619,11 @@ mod tests {
         let mut log = Log::new();
         log.start("go").assistant(None, std::slice::from_ref(&a));
         log.start("again");
-        let mut live = HistoryProjection::new();
+        let mut live = ConversationProjection::new();
         for event in &log.events {
             live.apply(event);
         }
-        assert!(failed_result_for(live.history(), &a));
+        assert!(failed_result_for(&live.messages(), &a));
     }
 
     #[test]
@@ -531,108 +656,42 @@ mod tests {
     }
 
     #[test]
-    fn model_message_view_filters_only_reminders_before_last_conversation_item() {
-        let context = HistoryItem::EnvironmentContext(EnvironmentContext::Unavailable);
-        let result = HistoryItem::ToolResult(ToolResult {
+    fn default_message_view_maps_every_item_in_order() {
+        let result = ConversationItem::ToolResult(ToolResult {
             call_id: ToolCallId::from("opaque/call"),
             tool_name: "echo".into(),
             output: "result".into(),
             status: ToolCallStatus::Completed,
         });
-        let cases = [
-            (
-                "last assistant keeps every later reminder",
-                vec![
-                    HistoryItem::system_reminder(SystemReminder::custom("old")),
-                    HistoryItem::user(None, "hello"),
-                    HistoryItem::assistant(Some("answer".into()), vec![]),
-                    HistoryItem::system_reminder(SystemReminder::custom("tail 1")),
-                    HistoryItem::system_reminder(SystemReminder::custom("tail 2")),
-                ],
-                vec![
-                    "hello".into(),
-                    "answer".into(),
-                    "tail 1".into(),
-                    "tail 2".into(),
-                ],
-            ),
-            (
-                "tool result expires earlier reminders",
-                vec![
-                    HistoryItem::user(None, "hello"),
-                    HistoryItem::system_reminder(SystemReminder::custom("old")),
-                    result.clone(),
-                    HistoryItem::system_reminder(SystemReminder::custom("tail")),
-                ],
-                vec!["hello".into(), "result".into(), "tail".into()],
-            ),
-            (
-                "reminders without conversation items are retained",
-                vec![
-                    HistoryItem::system_reminder(SystemReminder::custom("first")),
-                    context.clone(),
-                    HistoryItem::system_reminder(SystemReminder::custom("second")),
-                ],
-                vec![
-                    "first".into(),
-                    render_environment_context(&EnvironmentContext::Unavailable),
-                    "second".into(),
-                ],
-            ),
-            ("empty history stays empty", vec![], vec![]),
-            (
-                "environment context is not a reminder boundary",
-                vec![
-                    HistoryItem::user(None, "hello"),
-                    HistoryItem::system_reminder(SystemReminder::custom("first")),
-                    context.clone(),
-                    HistoryItem::system_reminder(SystemReminder::custom("second")),
-                ],
-                vec![
-                    "hello".into(),
-                    "first".into(),
-                    render_environment_context(&EnvironmentContext::Unavailable),
-                    "second".into(),
-                ],
-            ),
-            (
-                "a later user message expires reminders",
-                vec![
-                    HistoryItem::system_reminder(SystemReminder::custom("old")),
-                    HistoryItem::user(None, "new"),
-                ],
-                vec!["new".into()],
-            ),
-            (
-                "a later assistant message expires reminders",
-                vec![
-                    HistoryItem::user(None, "hello"),
-                    HistoryItem::system_reminder(SystemReminder::custom("old")),
-                    HistoryItem::assistant(Some("answer".into()), vec![]),
-                ],
-                vec!["hello".into(), "answer".into()],
-            ),
+        let input = vec![
+            ConversationItem::user(None, "hello"),
+            result,
+            ConversationItem::EnvironmentContext(EnvironmentContext::Unavailable),
+            reminder_item("first"),
+            reminder_item("second"),
         ];
-
-        let formatter = OpenAiFormatter;
-        for (name, input, expected) in cases {
-            let before = input.clone();
-            let messages = formatter.history_items_to_messages(&input);
-            assert_eq!(
-                messages.iter().map(message_text).collect::<Vec<_>>(),
-                expected,
-                "{name}"
-            );
-            assert_eq!(input, before, "{name} modified its input");
-        }
+        let before = input.clone();
+        let messages = OpenAiFormatter.history_items_to_messages(&input);
+        assert_eq!(
+            messages.iter().map(message_text).collect::<Vec<_>>(),
+            vec![
+                "hello".to_string(),
+                "result".to_string(),
+                render_environment_context(&EnvironmentContext::Unavailable),
+                "first".to_string(),
+                "second".to_string(),
+            ]
+        );
+        assert_eq!(input, before);
+        assert!(OpenAiFormatter.history_items_to_messages(&[]).is_empty());
     }
 
     #[test]
     fn fill_missing_is_idempotent_and_needs_an_assistant() {
         let (a, b) = (call(), call());
         let mut history = vec![
-            HistoryItem::user(None, "go"),
-            HistoryItem::assistant(None, vec![a.clone(), b.clone()]),
+            ConversationItem::user(None, "go"),
+            ConversationItem::assistant(None, vec![a.clone(), b.clone()]),
             ToolResult::completed(&a, "ok").into(),
         ];
         fill_missing_tool_results(&mut history);
@@ -641,42 +700,9 @@ mod tests {
         fill_missing_tool_results(&mut history);
         assert_eq!(history, before);
 
-        let mut only_user = vec![HistoryItem::user(None, "hi")];
+        let mut only_user = vec![ConversationItem::user(None, "hi")];
         fill_missing_tool_results(&mut only_user);
         assert_eq!(only_user.len(), 1);
-    }
-
-    #[test]
-    fn missing_tool_results_are_inserted_before_valid_tail_reminders() {
-        let (completed, missing) = (call(), call());
-        let mut history = vec![
-            HistoryItem::user(None, "go"),
-            HistoryItem::assistant(None, vec![completed.clone(), missing.clone()]),
-            ToolResult::completed(&completed, "ok").into(),
-            HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
-            HistoryItem::EnvironmentContext(EnvironmentContext::Unavailable),
-            HistoryItem::system_reminder(SystemReminder::custom("finish")),
-        ];
-
-        fill_missing_tool_results(&mut history);
-
-        assert_eq!(history.len(), 7);
-        assert!(matches!(
-            &history[3],
-            HistoryItem::ToolResult(result)
-                if result.call_id == missing.id && result.status == ToolCallStatus::Failed
-        ));
-        assert!(matches!(
-            history[4],
-            HistoryItem::SystemReminder(SystemReminder::ToolLimitReached)
-        ));
-        assert!(matches!(
-            history[6],
-            HistoryItem::SystemReminder(SystemReminder::Custom { .. })
-        ));
-        let before = history.clone();
-        fill_missing_tool_results(&mut history);
-        assert_eq!(history, before);
     }
 
     #[test]
@@ -684,13 +710,13 @@ mod tests {
         let call = call();
         let mut log = Log::new();
         log.start("go").assistant(None, std::slice::from_ref(&call));
-        let mut live = HistoryProjection::new();
+        let mut live = ConversationProjection::new();
         for event in &log.events {
             live.apply(event);
         }
         assert!(!live
-            .history()
+            .messages()
             .iter()
-            .any(|item| matches!(item, HistoryItem::ToolResult(_))));
+            .any(|item| matches!(item, ConversationItem::ToolResult(_))));
     }
 }

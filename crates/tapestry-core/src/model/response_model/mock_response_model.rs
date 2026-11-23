@@ -26,14 +26,14 @@ impl ResponseModel for MockResponseModel {
 #[cfg(test)]
 mod tests {
     use tapestry_protocol::{
-        AssistantMessageEvent, EnvironmentContextUpdatedEvent, Event, EventMsg, HistoryItem,
+        AssistantMessageEvent, ConversationItem, EnvironmentContextUpdatedEvent, Event, EventMsg,
         MessageId, ModelStreamItem, SubmissionId, SystemReminderEvent, ThreadId, ToolCallEndEvent,
         ToolResult, TurnId, UserMessageEvent,
     };
 
     use super::*;
 
-    fn request(items: Vec<HistoryItem>, iteration: u32) -> ModelRequest {
+    fn request(items: Vec<ConversationItem>, iteration: u32) -> ModelRequest {
         let submission_id = SubmissionId::new();
         let thread_id = ThreadId::new();
         let turn_id = TurnId::new();
@@ -42,10 +42,10 @@ mod tests {
             .enumerate()
             .map(|(index, item)| {
                 let msg = match item {
-                    HistoryItem::User { name, content } => {
+                    ConversationItem::User { name, content } => {
                         EventMsg::UserMessage(UserMessageEvent { name, content })
                     }
-                    HistoryItem::Assistant {
+                    ConversationItem::Assistant {
                         content,
                         tool_calls,
                     } => EventMsg::AssistantMessage(AssistantMessageEvent {
@@ -53,20 +53,19 @@ mod tests {
                         content,
                         tool_calls,
                     }),
-                    HistoryItem::ToolResult(result) => EventMsg::ToolCallEnd(ToolCallEndEvent {
-                        result,
-                        duration_ms: None,
-                    }),
-                    HistoryItem::EnvironmentContext(context) => {
+                    ConversationItem::ToolResult(result) => {
+                        EventMsg::ToolCallEnd(ToolCallEndEvent {
+                            result,
+                            duration_ms: None,
+                        })
+                    }
+                    ConversationItem::EnvironmentContext(context) => {
                         EventMsg::EnvironmentContextUpdated(EnvironmentContextUpdatedEvent {
                             context,
                         })
                     }
-                    HistoryItem::SystemReminder(reminder) => {
-                        EventMsg::SystemReminder(SystemReminderEvent {
-                            iteration: 0,
-                            reminder,
-                        })
+                    ConversationItem::SystemReminder(reminder) => {
+                        EventMsg::SystemReminder(SystemReminderEvent { reminder })
                     }
                 };
                 Event {
@@ -89,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_response_streams_echo_and_final_response() {
-        let req = request(vec![HistoryItem::user(None, "hello  world")], 0);
+        let req = request(vec![ConversationItem::user(None, "hello  world")], 0);
         let expected = MockResponseModel.respond(req.clone()).await.unwrap();
         let mut stream = MockResponseModel.stream(req).await.unwrap();
         let mut text = String::new();
@@ -111,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_response_streams_tool_call_without_text_then_summarizes_result() {
-        let user = HistoryItem::user(None, "tool:echo");
+        let user = ConversationItem::user(None, "tool:echo");
         let mut stream = MockResponseModel
             .stream(request(vec![user.clone()], 0))
             .await
@@ -130,7 +129,7 @@ mod tests {
             .respond(request(
                 vec![
                     user,
-                    HistoryItem::assistant(None, vec![call.clone()]),
+                    ConversationItem::assistant(None, vec![call.clone()]),
                     ToolResult::completed(call, "hi").into(),
                 ],
                 1,

@@ -12,7 +12,7 @@ use crate::agent::AgentLoop;
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
-use crate::formatter::formatter_trait::HistoryProjection;
+use crate::formatter::formatter_trait::ConversationProjection;
 use crate::model::ModelClient;
 use crate::recorder::Recorder;
 use crate::store::{EventStore, EventSubscription, InMemoryEventStore};
@@ -101,7 +101,7 @@ impl ThreadBuilder {
 
     /// Start a new thread. Must be called within a Tokio runtime.
     pub fn spawn(self) -> (TapestryThread, ThreadHandle) {
-        self.start(ThreadId::new(), HistoryProjection::new())
+        self.start(ThreadId::new(), ConversationProjection::new())
     }
 
     /// Continue an existing thread from its event log: history is folded from
@@ -113,14 +113,14 @@ impl ThreadBuilder {
         thread_id: ThreadId,
     ) -> Result<(TapestryThread, ThreadHandle), CoreError> {
         let events = self.store.read_after(thread_id, 0).await?;
-        let projection = HistoryProjection::fold(&events);
+        let projection = ConversationProjection::fold(&events);
         Ok(self.start(thread_id, projection))
     }
 
     fn start(
         self,
         thread_id: ThreadId,
-        projection: HistoryProjection,
+        projection: ConversationProjection,
     ) -> (TapestryThread, ThreadHandle) {
         let (submission_tx, submission_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
         let handle = ThreadHandle {
@@ -282,7 +282,8 @@ mod tests {
     use std::time::Duration;
 
     use tapestry_protocol::{
-        Event, EventMsg, FinishReason, HistoryItem, ModelRequest, ModelResponse, ThreadSettings,
+        ConversationItem, Event, EventMsg, FinishReason, ModelRequest, ModelResponse,
+        ThreadSettings,
     };
 
     use super::*;
@@ -296,8 +297,8 @@ mod tests {
     use crate::store::NewEvent;
     use crate::tool::{EchoTool, ToolRegistry};
 
-    fn request_history(request: &ModelRequest) -> Vec<HistoryItem> {
-        OpenAiFormatter.events_to_history_items(&request.events)
+    fn request_history(request: &ModelRequest) -> Vec<ConversationItem> {
+        OpenAiFormatter.events_to_items(&request.events)
     }
 
     fn test_tools() -> Arc<ToolRegistry> {
@@ -442,7 +443,7 @@ mod tests {
         async fn before_model(
             &self,
             _ctx: &HookCtx<'_>,
-            _request: &mut ModelRequest,
+            _events: &[tapestry_protocol::Event],
         ) -> Result<(), CoreError> {
             if self.fail_before_model {
                 return Err(CoreError::Tool("middleware failure".into()));
@@ -606,7 +607,7 @@ mod tests {
             async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
                 let n = request_history(&request)
                     .iter()
-                    .filter(|i| matches!(i, HistoryItem::EnvironmentContext(_)))
+                    .filter(|i| matches!(i, ConversationItem::EnvironmentContext(_)))
                     .count();
                 Ok(ModelResponse {
                     content: Some(n.to_string()),
@@ -857,18 +858,18 @@ mod tests {
             .any(|e| e.id == failed && matches!(e.msg, EventMsg::Error(_))));
 
         let log = store.read_after(handle.thread_id(), 0).await.unwrap();
-        let history = HistoryProjection::fold(&log).history().to_vec();
+        let history = ConversationProjection::fold(&log).messages();
         let calls: Vec<_> = history
             .iter()
             .flat_map(|i| match i {
-                HistoryItem::Assistant { tool_calls, .. } => tool_calls.clone(),
+                ConversationItem::Assistant { tool_calls, .. } => tool_calls.clone(),
                 _ => vec![],
             })
             .collect();
         assert_eq!(calls.len(), 1);
         assert!(history
             .iter()
-            .any(|i| matches!(i, HistoryItem::ToolResult(r) if r.call_id == calls[0].id)));
+            .any(|i| matches!(i, ConversationItem::ToolResult(r) if r.call_id == calls[0].id)));
     }
 
     #[tokio::test]
@@ -918,8 +919,8 @@ mod tests {
             })
             .await;
 
-        // The forced-finish reminder is the tenth append in this turn.
-        store.fail_once_after(9);
+        // The forced-finish reminder is the ninth append in this turn.
+        store.fail_once_after(8);
         let events = client.turn("tool:echo", None).await;
 
         let error = events
@@ -968,7 +969,7 @@ mod tests {
         c.turn("plain", Some("alice")).await;
 
         let log = store.read_after(handle.thread_id(), 0).await.unwrap();
-        let folded = HistoryProjection::fold(&log).history().to_vec();
+        let folded = ConversationProjection::fold(&log).messages();
         model.requests.lock().unwrap().clear();
         c.turn("next", None).await;
         let captured = model.requests.lock().unwrap()[0].clone();
@@ -987,7 +988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reminders_remain_in_event_history_but_expire_from_later_messages() {
+    async fn consumed_reminders_remain_in_the_log_but_not_in_later_messages() {
         let store = Arc::new(InMemoryEventStore::new());
         let model = Arc::new(RecordingModel::default());
         let (_thread, handle) = TapestryThread::builder(model.clone(), test_tools())
@@ -1024,10 +1025,13 @@ mod tests {
             .read_after(client.handle.thread_id(), 0)
             .await
             .unwrap();
-        assert!(HistoryProjection::fold(&stored)
-            .history()
+        assert!(stored
             .iter()
-            .any(|item| matches!(item, HistoryItem::SystemReminder(_))));
+            .any(|event| matches!(event.msg, EventMsg::SystemReminder(_))));
+        assert!(!ConversationProjection::fold(&stored)
+            .messages()
+            .iter()
+            .any(|item| matches!(item, ConversationItem::SystemReminder(_))));
     }
 
     #[tokio::test]
@@ -1050,7 +1054,6 @@ mod tests {
                     turn_id: None,
                     timestamp_ms: 10,
                     msg: EventMsg::SystemReminder(tapestry_protocol::SystemReminderEvent {
-                        iteration: 1,
                         reminder: tapestry_protocol::SystemReminder::ToolLimitReached,
                     }),
                 },
@@ -1081,10 +1084,10 @@ mod tests {
             .iter()
             .all(|message| message.content.first_text() != Some(reminder_text.as_str())));
         let log = store.read_after(thread_id, 0).await.unwrap();
-        assert!(HistoryProjection::fold(&log)
-            .history()
+        assert!(!ConversationProjection::fold(&log)
+            .messages()
             .iter()
-            .any(|item| matches!(item, HistoryItem::SystemReminder(_))));
+            .any(|item| matches!(item, ConversationItem::SystemReminder(_))));
         let positions: Vec<_> = log.iter().map(|e| e.log_position).collect();
         assert_eq!(positions, (1..=log.len() as u64).collect::<Vec<_>>());
         // The resumed thread's first event directly follows the old log.

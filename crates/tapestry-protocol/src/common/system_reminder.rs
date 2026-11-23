@@ -1,8 +1,9 @@
-//! Transient instructions for a single model request.
+//! Instructions recorded as events and delivered with the next model request.
 
 use serde::{Deserialize, Serialize};
 
-/// Transient instruction for a single model request; never persisted.
+/// Instruction recorded as a `SystemReminder` event; the next completed model
+/// request consumes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reminder", rename_all = "snake_case")]
 pub enum SystemReminder {

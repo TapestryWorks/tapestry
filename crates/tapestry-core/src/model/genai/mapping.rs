@@ -136,12 +136,13 @@ mod tests {
         ContentPart, PromptTokensDetails, StreamChunk, StreamEnd, ToolCall as GenaiToolCall,
     };
     use tapestry_protocol::{
-        AssistantMessageEvent, EnvironmentContext, EnvironmentContextUpdatedEvent, Event, EventMsg,
-        HistoryItem, MessageId, ModelRequest, SubmissionId, SystemReminder, SystemReminderEvent,
-        ThreadId, ToolCallEndEvent, ToolResult, ToolSpec, TurnId, UserMessageEvent,
+        AssistantMessageEvent, ConversationItem, EnvironmentContext,
+        EnvironmentContextUpdatedEvent, Event, EventMsg, MessageId, ModelRequest, SubmissionId,
+        SystemReminder, SystemReminderEvent, ThreadId, ToolCallEndEvent, ToolResult, ToolSpec,
+        TurnId, UserMessageEvent,
     };
 
-    fn request(items: Vec<HistoryItem>, tools: Vec<ToolSpec>) -> ModelRequest {
+    fn request(items: Vec<ConversationItem>, tools: Vec<ToolSpec>) -> ModelRequest {
         let submission_id = SubmissionId::new();
         let thread_id = ThreadId::new();
         let turn_id = TurnId::new();
@@ -150,10 +151,10 @@ mod tests {
             .enumerate()
             .map(|(index, item)| {
                 let msg = match item {
-                    HistoryItem::User { name, content } => {
+                    ConversationItem::User { name, content } => {
                         EventMsg::UserMessage(UserMessageEvent { name, content })
                     }
-                    HistoryItem::Assistant {
+                    ConversationItem::Assistant {
                         content,
                         tool_calls,
                     } => EventMsg::AssistantMessage(AssistantMessageEvent {
@@ -161,20 +162,19 @@ mod tests {
                         content,
                         tool_calls,
                     }),
-                    HistoryItem::ToolResult(result) => EventMsg::ToolCallEnd(ToolCallEndEvent {
-                        result,
-                        duration_ms: None,
-                    }),
-                    HistoryItem::EnvironmentContext(context) => {
+                    ConversationItem::ToolResult(result) => {
+                        EventMsg::ToolCallEnd(ToolCallEndEvent {
+                            result,
+                            duration_ms: None,
+                        })
+                    }
+                    ConversationItem::EnvironmentContext(context) => {
                         EventMsg::EnvironmentContextUpdated(EnvironmentContextUpdatedEvent {
                             context,
                         })
                     }
-                    HistoryItem::SystemReminder(reminder) => {
-                        EventMsg::SystemReminder(SystemReminderEvent {
-                            iteration: 0,
-                            reminder,
-                        })
+                    ConversationItem::SystemReminder(reminder) => {
+                        EventMsg::SystemReminder(SystemReminderEvent { reminder })
                     }
                 };
                 Event {
@@ -199,9 +199,9 @@ mod tests {
     fn maps_system_prompt_and_named_user_prefix() {
         let chat_req = model_request_to_chat_request(&request(
             vec![
-                HistoryItem::user(Some("alice".into()), "hi"),
-                HistoryItem::user(Some("bob".into()), "yo"),
-                HistoryItem::user(None, "plain"),
+                ConversationItem::user(Some("alice".into()), "hi"),
+                ConversationItem::user(Some("bob".into()), "yo"),
+                ConversationItem::user(None, "plain"),
             ],
             vec![],
         ));
@@ -222,7 +222,7 @@ mod tests {
         let chat_req = model_request_to_chat_request(&request(
             vec![
                 context.clone().into(),
-                HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
+                ConversationItem::system_reminder(SystemReminder::ToolLimitReached),
             ],
             vec![],
         ));
@@ -250,10 +250,10 @@ mod tests {
         );
         let chat_req = model_request_to_chat_request(&request(
             vec![
-                HistoryItem::user(None, "go"),
-                HistoryItem::assistant(Some("calling".into()), vec![call.clone()]),
+                ConversationItem::user(None, "go"),
+                ConversationItem::assistant(Some("calling".into()), vec![call.clone()]),
                 ToolResult::completed(&call, "x").into(),
-                HistoryItem::assistant(Some("done".into()), vec![]),
+                ConversationItem::assistant(Some("done".into()), vec![]),
             ],
             vec![],
         ));
@@ -277,7 +277,7 @@ mod tests {
     fn maps_tool_specs() {
         let spec = crate::tool::EchoTool.spec();
         let chat_req = model_request_to_chat_request(&request(
-            vec![HistoryItem::user(None, "go")],
+            vec![ConversationItem::user(None, "go")],
             vec![spec.clone()],
         ));
         let tools = chat_req.tools.unwrap();
@@ -294,12 +294,12 @@ mod tests {
         struct CustomFormatter;
 
         impl Formatter for CustomFormatter {
-            fn history_items_to_messages(&self, _items: &[HistoryItem]) -> Vec<ChatMessage> {
+            fn history_items_to_messages(&self, _items: &[ConversationItem]) -> Vec<ChatMessage> {
                 vec![ChatMessage::user("custom message")]
             }
         }
 
-        let empty = request(vec![HistoryItem::user(None, "original")], vec![]);
+        let empty = request(vec![ConversationItem::user(None, "original")], vec![]);
         let mapped = model_request_to_chat_request_with_formatter(&empty, &CustomFormatter);
         assert_eq!(mapped.system.as_deref(), Some("You are helpful."));
         assert_eq!(mapped.messages.len(), 1);

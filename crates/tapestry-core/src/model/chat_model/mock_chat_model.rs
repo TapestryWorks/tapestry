@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use tapestry_protocol::{
-    HistoryItem, ModelRequest, ModelResponse, ModelStreamItem, TokenUsage, ToolCall, ToolCallId,
+    ConversationItem, ModelRequest, ModelResponse, ModelStreamItem, TokenUsage, ToolCall,
+    ToolCallId,
 };
 
 use crate::error::CoreError;
@@ -34,14 +35,16 @@ pub struct MockChatModel;
 #[async_trait]
 impl ChatModel for MockChatModel {
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
-        let history = OpenAiFormatter.events_to_history_items(&request.events);
+        let history = OpenAiFormatter.events_to_items(&request.events);
         let Some((idx, name, content)) =
             history
                 .iter()
                 .enumerate()
                 .rev()
                 .find_map(|(idx, item)| match item {
-                    HistoryItem::User { name, content } => Some((idx, name.as_deref(), content)),
+                    ConversationItem::User { name, content } => {
+                        Some((idx, name.as_deref(), content))
+                    }
                     _ => None,
                 })
         else {
@@ -56,7 +59,7 @@ impl ChatModel for MockChatModel {
         let results: Vec<(&str, &str)> = history[idx + 1..]
             .iter()
             .filter_map(|item| match item {
-                HistoryItem::ToolResult(result) => {
+                ConversationItem::ToolResult(result) => {
                     Some((result.tool_name.as_str(), result.output.as_str()))
                 }
                 _ => None,
@@ -125,14 +128,14 @@ fn parse_tool_request(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use tapestry_protocol::{
-        AssistantMessageEvent, EnvironmentContext, EnvironmentContextUpdatedEvent, Event, EventMsg,
-        HistoryItem, MessageId, SubmissionId, SystemReminder, SystemReminderEvent, ThreadId,
-        ToolCallEndEvent, ToolResult, TurnId, UserMessageEvent,
+        AssistantMessageEvent, ConversationItem, EnvironmentContext,
+        EnvironmentContextUpdatedEvent, Event, EventMsg, MessageId, SubmissionId, SystemReminder,
+        SystemReminderEvent, ThreadId, ToolCallEndEvent, ToolResult, TurnId, UserMessageEvent,
     };
 
     use super::*;
 
-    fn request(items: Vec<HistoryItem>, iteration: u32) -> ModelRequest {
+    fn request(items: Vec<ConversationItem>, iteration: u32) -> ModelRequest {
         let submission_id = SubmissionId::new();
         let thread_id = ThreadId::new();
         let turn_id = TurnId::new();
@@ -141,10 +144,10 @@ mod tests {
             .enumerate()
             .map(|(index, item)| {
                 let msg = match item {
-                    HistoryItem::User { name, content } => {
+                    ConversationItem::User { name, content } => {
                         EventMsg::UserMessage(UserMessageEvent { name, content })
                     }
-                    HistoryItem::Assistant {
+                    ConversationItem::Assistant {
                         content,
                         tool_calls,
                     } => EventMsg::AssistantMessage(AssistantMessageEvent {
@@ -152,20 +155,19 @@ mod tests {
                         content,
                         tool_calls,
                     }),
-                    HistoryItem::ToolResult(result) => EventMsg::ToolCallEnd(ToolCallEndEvent {
-                        result,
-                        duration_ms: None,
-                    }),
-                    HistoryItem::EnvironmentContext(context) => {
+                    ConversationItem::ToolResult(result) => {
+                        EventMsg::ToolCallEnd(ToolCallEndEvent {
+                            result,
+                            duration_ms: None,
+                        })
+                    }
+                    ConversationItem::EnvironmentContext(context) => {
                         EventMsg::EnvironmentContextUpdated(EnvironmentContextUpdatedEvent {
                             context,
                         })
                     }
-                    HistoryItem::SystemReminder(reminder) => {
-                        EventMsg::SystemReminder(SystemReminderEvent {
-                            iteration: 0,
-                            reminder,
-                        })
+                    ConversationItem::SystemReminder(reminder) => {
+                        EventMsg::SystemReminder(SystemReminderEvent { reminder })
                     }
                 };
                 Event {
@@ -196,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_stream_deltas_concatenate_to_complete_text() {
-        let req = request(vec![HistoryItem::user(None, "hello  big world")], 0);
+        let req = request(vec![ConversationItem::user(None, "hello  big world")], 0);
         let expected = MockChatModel.complete(req.clone()).await.unwrap();
         let items = drain(MockChatModel.stream(req).await.unwrap()).await;
         let (last, deltas) = items.split_last().unwrap();
@@ -217,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_stream_without_text_has_no_deltas() {
-        let req = request(vec![HistoryItem::user(None, "tool:echo")], 0);
+        let req = request(vec![ConversationItem::user(None, "tool:echo")], 0);
         let items = drain(MockChatModel.stream(req).await.unwrap()).await;
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], Ok(ModelStreamItem::Completed { .. })));
@@ -226,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn mock_echoes_plain_message() {
         let response = MockChatModel
-            .complete(request(vec![HistoryItem::user(None, "hello")], 0))
+            .complete(request(vec![ConversationItem::user(None, "hello")], 0))
             .await
             .unwrap();
 
@@ -238,7 +240,7 @@ mod tests {
     async fn mock_uses_name_prefix_for_named_user() {
         let response = MockChatModel
             .complete(request(
-                vec![HistoryItem::user(Some("alice".into()), "hi")],
+                vec![ConversationItem::user(Some("alice".into()), "hi")],
                 0,
             ))
             .await
@@ -248,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_requests_tool_then_summarizes() {
-        let user = HistoryItem::user(None, "please tool:echo now");
+        let user = ConversationItem::user(None, "please tool:echo now");
 
         let first = MockChatModel
             .complete(request(vec![user.clone()], 0))
@@ -262,7 +264,7 @@ mod tests {
             .complete(request(
                 vec![
                     user,
-                    HistoryItem::assistant(None, vec![call.clone()]),
+                    ConversationItem::assistant(None, vec![call.clone()]),
                     ToolResult::completed(&call, "hi").into(),
                 ],
                 1,
@@ -279,11 +281,11 @@ mod tests {
         let response = MockChatModel
             .complete(request(
                 vec![
-                    HistoryItem::user(None, "tool:echo"),
-                    HistoryItem::assistant(None, vec![call.clone()]),
+                    ConversationItem::user(None, "tool:echo"),
+                    ConversationItem::assistant(None, vec![call.clone()]),
                     ToolResult::completed(&call, "x").into(),
-                    HistoryItem::assistant(Some("Done".into()), vec![]),
-                    HistoryItem::user(None, "plain"),
+                    ConversationItem::assistant(Some("Done".into()), vec![]),
+                    ConversationItem::user(None, "plain"),
                 ],
                 0,
             ))
@@ -297,9 +299,9 @@ mod tests {
         let response = MockChatModel
             .complete(request(
                 vec![
-                    HistoryItem::user(None, "question"),
+                    ConversationItem::user(None, "question"),
                     EnvironmentContext::Unavailable.into(),
-                    HistoryItem::system_reminder(SystemReminder::ToolLimitReached),
+                    ConversationItem::system_reminder(SystemReminder::ToolLimitReached),
                 ],
                 1,
             ))

@@ -220,7 +220,6 @@ mod tests {
             ),
             (
                 EventMsg::SystemReminder(SystemReminderEvent {
-                    iteration: 0,
                     reminder: SystemReminder::ToolLimitReached,
                 }),
                 EventCategory::Context,

@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use tapestry_protocol::{Event, EventMsg, HistoryItem, SubmissionId, ThreadId, TurnId};
+use tapestry_protocol::{ConversationItem, Event, EventMsg, SubmissionId, ThreadId, TurnId};
 
 use crate::clock::Clock;
 use crate::error::CoreError;
-use crate::formatter::formatter_trait::HistoryProjection;
+use crate::formatter::formatter_trait::ConversationProjection;
 use crate::store::{EventStore, NewEvent};
 
 /// Records a thread's events and keeps its history projection current.
@@ -17,14 +17,14 @@ pub struct Recorder {
     store: Arc<dyn EventStore>,
     clock: Arc<dyn Clock>,
     thread_id: ThreadId,
-    projection: HistoryProjection,
+    projection: ConversationProjection,
     submission_id: SubmissionId,
     turn_id: Option<TurnId>,
 }
 
 impl Recorder {
     pub fn new(store: Arc<dyn EventStore>, clock: Arc<dyn Clock>, thread_id: ThreadId) -> Self {
-        Self::with_projection(store, clock, thread_id, HistoryProjection::new())
+        Self::with_projection(store, clock, thread_id, ConversationProjection::new())
     }
 
     /// Continue from an existing projection, e.g. one folded from the log.
@@ -32,7 +32,7 @@ impl Recorder {
         store: Arc<dyn EventStore>,
         clock: Arc<dyn Clock>,
         thread_id: ThreadId,
-        projection: HistoryProjection,
+        projection: ConversationProjection,
     ) -> Self {
         Self {
             store,
@@ -62,8 +62,8 @@ impl Recorder {
         self.turn_id
     }
 
-    pub fn history(&self) -> &[HistoryItem] {
-        self.projection.history()
+    pub fn messages(&self) -> Vec<ConversationItem> {
+        self.projection.messages()
     }
 
     /// Read an immutable snapshot of the thread's complete event log.
@@ -71,7 +71,7 @@ impl Recorder {
         self.store.read_after(self.thread_id, 0).await
     }
 
-    pub fn projection(&self) -> &HistoryProjection {
+    pub fn projection(&self) -> &ConversationProjection {
         &self.projection
     }
 
@@ -127,7 +127,7 @@ mod tests {
             (sid, 1, thread, Some(turn))
         );
         assert_eq!(event.timestamp_ms, 42);
-        assert_eq!(recorder.history(), [HistoryItem::user(None, "hi")]);
+        assert_eq!(recorder.messages(), [ConversationItem::user(None, "hi")]);
 
         recorder.begin_submission(SubmissionId::new());
         let event = recorder

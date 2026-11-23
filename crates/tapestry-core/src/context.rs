@@ -4,18 +4,18 @@
 //! rewriting history needs no extra bookkeeping. Every entry is a complete
 //! snapshot.
 
-use tapestry_protocol::{EnvironmentContext, HistoryItem};
+use tapestry_protocol::{ConversationItem, EnvironmentContext};
 
 use crate::clock::Clock;
 
 /// Return the entry to append this turn, if any.
 pub fn next_context_entry(
-    history: &[HistoryItem],
+    history: &[ConversationItem],
     enabled: bool,
     clock: &dyn Clock,
 ) -> Option<EnvironmentContext> {
     let baseline = history.iter().rev().find_map(|item| match item {
-        HistoryItem::EnvironmentContext(context) => Some(context),
+        ConversationItem::EnvironmentContext(context) => Some(context),
         _ => None,
     });
 
@@ -53,10 +53,10 @@ mod tests {
         }
     }
 
-    fn with(context: Option<EnvironmentContext>) -> Vec<HistoryItem> {
-        let mut history = vec![HistoryItem::user(None, "earlier")];
-        history.extend(context.map(HistoryItem::from));
-        history.push(HistoryItem::user(None, "later"));
+    fn with(context: Option<EnvironmentContext>) -> Vec<ConversationItem> {
+        let mut history = vec![ConversationItem::user(None, "earlier")];
+        history.extend(context.map(ConversationItem::from));
+        history.push(ConversationItem::user(None, "later"));
         history
     }
 
@@ -133,7 +133,7 @@ mod tests {
         let history = vec![
             available("2026-11-04", "UTC").into(),
             available("2026-11-05", "UTC").into(),
-            HistoryItem::user(None, "x"),
+            ConversationItem::user(None, "x"),
         ];
         assert_eq!(next_context_entry(&history, true, &working()), None);
     }

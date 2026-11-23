@@ -79,10 +79,9 @@ pub struct EnvironmentContextUpdatedEvent {
     pub context: EnvironmentContext,
 }
 
-/// A reminder recorded before a model request and retained in projected history.
+/// A reminder recorded as an event and consumed by the next completed model request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemReminderEvent {
-    pub iteration: u32,
     pub reminder: SystemReminder,
 }
 
@@ -293,7 +292,6 @@ mod tests {
             ),
             (
                 EventMsg::SystemReminder(SystemReminderEvent {
-                    iteration: 3,
                     reminder: SystemReminder::ToolLimitReached,
                 }),
                 "system_reminder",
@@ -339,15 +337,29 @@ mod tests {
     #[test]
     fn system_reminder_event_wire_format() {
         let msg = EventMsg::SystemReminder(SystemReminderEvent {
-            iteration: 1,
             reminder: SystemReminder::custom("be brief"),
         });
         assert_eq!(
             serde_json::to_value(&msg).unwrap(),
             json!({
                 "type": "system_reminder",
-                "iteration": 1,
                 "reminder": {"reminder": "custom", "text": "be brief"}
+            })
+        );
+    }
+
+    #[test]
+    fn system_reminder_event_ignores_legacy_iteration() {
+        let msg: EventMsg = serde_json::from_value(json!({
+            "type": "system_reminder",
+            "iteration": 1,
+            "reminder": {"reminder": "tool_limit_reached"}
+        }))
+        .unwrap();
+        assert_eq!(
+            msg,
+            EventMsg::SystemReminder(SystemReminderEvent {
+                reminder: SystemReminder::ToolLimitReached,
             })
         );
     }

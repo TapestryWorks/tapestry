@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod model;
 pub mod projection;
 pub mod recorder;
+mod reminder;
 pub mod store;
 pub mod thread;
 pub mod tool;
@@ -34,9 +35,9 @@ pub use model::{
     ChatModel, MockChatModel, MockModelClient, MockResponseModel, ModelClient, ModelStream,
     ModelStreamSource, ResponseModel,
 };
-pub use projection::HistoryProjection;
+pub use projection::ConversationProjection;
 pub use tapestry_protocol::{
-    EnvironmentContext, HistoryItem, ModelRequest, ModelResponse, SystemReminder, TokenUsage,
+    ConversationItem, EnvironmentContext, ModelRequest, ModelResponse, SystemReminder, TokenUsage,
     ToolCallId, ToolResult, ToolSpec,
 };
 
@@ -66,8 +67,8 @@ mod compatibility_tests {
         fn assert_model_client<T: crate::model::ModelClient>() {}
         assert_model_client::<crate::model::MockModelClient>();
 
-        let _: crate::projection::HistoryProjection =
-            crate::formatter::formatter_trait::HistoryProjection::new();
+        let _: crate::projection::ConversationProjection =
+            crate::formatter::formatter_trait::ConversationProjection::new();
         assert_eq!(
             crate::formatter::prompt::render_user(None, "hello"),
             "hello"

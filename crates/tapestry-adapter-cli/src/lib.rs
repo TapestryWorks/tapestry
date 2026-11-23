@@ -218,7 +218,6 @@ mod tests {
                 context: EnvironmentContext::Unavailable,
             }),
             EventMsg::SystemReminder(SystemReminderEvent {
-                iteration: 0,
                 reminder: SystemReminder::ToolLimitReached,
             }),
             EventMsg::ModelRequestStarted(ModelRequestStartedEvent {

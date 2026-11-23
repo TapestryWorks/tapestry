@@ -11,10 +11,10 @@ mod tests {
     use super::*;
     use genai::chat::ChatMessage;
     use tapestry_protocol::{
-        AssistantMessageEvent, EnvironmentContext, EnvironmentContextUpdatedEvent, Event, EventMsg,
-        HistoryItem, MessageId, SubmissionId, SystemReminder, SystemReminderEvent, ThreadId,
-        ToolCall, ToolCallEndEvent, ToolCallId, ToolCallStatus, ToolResult, TurnAbortReason,
-        TurnAbortedEvent, TurnStartedEvent, UserMessageEvent,
+        AssistantMessageEvent, ConversationItem, EnvironmentContext,
+        EnvironmentContextUpdatedEvent, Event, EventMsg, MessageId, SubmissionId, SystemReminder,
+        SystemReminderEvent, ThreadId, ToolCall, ToolCallEndEvent, ToolCallId, ToolCallStatus,
+        ToolResult, TurnAbortReason, TurnAbortedEvent, TurnStartedEvent, UserMessageEvent,
     };
 
     fn event(
@@ -104,7 +104,6 @@ mod tests {
             ),
             event(
                 EventMsg::SystemReminder(SystemReminderEvent {
-                    iteration: 0,
                     reminder: SystemReminder::custom("be brief"),
                 }),
                 Some(turn_id),
@@ -120,7 +119,7 @@ mod tests {
             ),
         ];
         let formatter: &dyn Formatter = &OpenAiFormatter;
-        let items = formatter.events_to_history_items(&events);
+        let items = formatter.events_to_items(&events);
         assert_eq!(items.len(), 5);
         let formatted = formatter.format(&events);
         assert_eq!(formatted.len(), 5);
@@ -148,7 +147,7 @@ mod tests {
         assert_eq!(formatted[4].content.first_text(), Some("be brief"));
         assert!(items
             .iter()
-            .any(|item| matches!(item, HistoryItem::SystemReminder(_))));
+            .any(|item| matches!(item, ConversationItem::SystemReminder(_))));
         assert_eq!(
             message_signatures(&formatted),
             message_signatures(&formatter.history_items_to_messages(&items))
@@ -160,8 +159,8 @@ mod tests {
         let formatter = OpenAiFormatter;
         let formatter: &dyn Formatter = &formatter;
         let messages = formatter.history_items_to_messages(&[
-            HistoryItem::user(None, "hello"),
-            HistoryItem::system_reminder(SystemReminder::custom("be brief")),
+            ConversationItem::user(None, "hello"),
+            ConversationItem::system_reminder(SystemReminder::custom("be brief")),
         ]);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.first_text(), Some("hello"));
@@ -173,8 +172,8 @@ mod tests {
         struct CustomProjection;
 
         impl Formatter for CustomProjection {
-            fn events_to_history_items(&self, _events: &[Event]) -> Vec<HistoryItem> {
-                vec![HistoryItem::user(None, "custom")]
+            fn events_to_items(&self, _events: &[Event]) -> Vec<ConversationItem> {
+                vec![ConversationItem::user(None, "custom")]
             }
         }
 
@@ -214,10 +213,10 @@ mod tests {
             ),
         ];
 
-        let history = formatter.events_to_history_items(&events);
+        let history = formatter.events_to_items(&events);
         assert!(history.iter().any(|item| matches!(
             item,
-            HistoryItem::ToolResult(result)
+            ConversationItem::ToolResult(result)
                 if result.call_id == call.id && result.status == ToolCallStatus::Failed
         )));
         let messages = formatter.format(&events);
@@ -254,7 +253,6 @@ mod tests {
             ),
             event(
                 EventMsg::SystemReminder(SystemReminderEvent {
-                    iteration: 1,
                     reminder: SystemReminder::custom("finish now"),
                 }),
                 Some(turn_id),
@@ -270,16 +268,16 @@ mod tests {
             ),
         ];
 
-        let items = formatter.events_to_history_items(&events);
+        let items = formatter.events_to_items(&events);
         assert!(matches!(
             &items[1],
-            HistoryItem::ToolResult(result)
+            ConversationItem::ToolResult(result)
                 if result.call_id.as_str() == "provider/opaque"
                     && result.status == ToolCallStatus::Failed
         ));
         assert!(matches!(
             &items[2],
-            HistoryItem::SystemReminder(SystemReminder::Custom { text }) if text == "finish now"
+            ConversationItem::SystemReminder(SystemReminder::Custom { text }) if text == "finish now"
         ));
 
         let messages = formatter.format(&events);

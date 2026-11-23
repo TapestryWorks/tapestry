@@ -5,6 +5,6 @@ pub mod prompt;
 
 pub mod openai_formatter;
 
+pub use formatter_trait::ConversationProjection;
 pub use formatter_trait::Formatter;
-pub use formatter_trait::HistoryProjection;
 pub use openai_formatter::OpenAiFormatter;
