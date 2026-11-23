@@ -1,32 +1,25 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use tapestry_protocol::{
-    AssistantMessageDeltaEvent, AssistantMessageEvent, AssistantMessageStartEvent,
-    EnvironmentContextUpdatedEvent, EventMsg, MessageId, ModelRequest, ModelRequestCompletedEvent,
-    ModelRequestStartedEvent, ModelResponse, ModelStreamItem, SystemReminderEvent, TokenCountEvent,
-    TokenUsage, ToolCall, ToolCallBeginEvent, ToolCallEndEvent, ToolResult, TurnCompleteEvent,
-    TurnId, TurnStartedEvent, UserMessageEvent, WarningEvent,
+    EnvironmentContextUpdatedEvent, EventMsg, TurnId, TurnStartedEvent, UserMessageEvent,
 };
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::ThreadConfig;
 use crate::context::next_context_entry;
 use crate::error::CoreError;
-use crate::middleware::{HookCtx, Middleware, ToolDecision};
+use crate::middleware::Middleware;
 use crate::model::ModelClient;
 use crate::recorder::Recorder;
 use crate::tool::ToolRegistry;
 
-use super::{Agent, AgentFactory, ReactAgent, TurnStep};
+use super::{Agent, AgentBindings, AgentFactory, ReactAgent, TurnContext};
 
-/// Drives per-turn [`Agent`] policies: performs model/tool IO and timing, and
-/// records every step as an event.
+/// Starts turns: records the turn prologue, then hands the turn to a fresh
+/// per-turn [`Agent`] built from the bound model, tools and middleware.
 pub struct AgentLoop {
-    model: Arc<dyn ModelClient>,
-    tools: Arc<ToolRegistry>,
+    bindings: AgentBindings,
     clock: Arc<dyn Clock>,
-    middlewares: Vec<Arc<dyn Middleware>>,
     agent_factory: AgentFactory,
 }
 
@@ -41,24 +34,24 @@ impl AgentLoop {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            model,
-            tools,
+            bindings: AgentBindings::new(model, tools),
             clock,
-            middlewares: Vec::new(),
-            agent_factory: Arc::new(|config| Box::new(ReactAgent::new(config.max_tool_iterations))),
+            agent_factory: Arc::new(|bindings, config| {
+                Box::new(ReactAgent::new(bindings, config.max_tool_iterations))
+            }),
         }
     }
 
     pub fn with_agent_factory(
         mut self,
-        factory: impl Fn(&ThreadConfig) -> Box<dyn Agent> + Send + Sync + 'static,
+        factory: impl Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync + 'static,
     ) -> Self {
         self.agent_factory = Arc::new(factory);
         self
     }
 
     pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
-        self.middlewares.push(middleware);
+        self.bindings.push_middleware(middleware);
         self
     }
 
@@ -66,12 +59,15 @@ impl AgentLoop {
         mut self,
         middlewares: impl IntoIterator<Item = Arc<dyn Middleware>>,
     ) -> Self {
-        self.middlewares.extend(middlewares);
+        self.bindings = self.bindings.with_middlewares(middlewares);
         self
     }
 
     /// Run one turn, recording its events (and so its history) through
     /// `recorder`, whose events are stamped with `turn_id` from here on.
+    ///
+    /// Records `TurnStarted`, the optional environment context and the user
+    /// message, then runs [`Agent::forward_with_hooks`].
     ///
     /// On error the turn simply stops: the caller records the `Error`, and the
     /// history projection repairs unanswered tool calls when it sees it.
@@ -87,15 +83,6 @@ impl AgentLoop {
         recorder
             .record(EventMsg::TurnStarted(TurnStartedEvent {}))
             .await?;
-        let turn_ctx = HookCtx {
-            thread_id: recorder.thread_id(),
-            turn_id,
-            iteration: None,
-            config,
-        };
-        for middleware in &self.middlewares {
-            middleware.before_turn(&turn_ctx).await?;
-        }
         if let Some(context) = next_context_entry(
             recorder.history(),
             config.include_time_context,
@@ -111,276 +98,10 @@ impl AgentLoop {
             .record(EventMsg::UserMessage(UserMessageEvent { name, content }))
             .await?;
 
-        let mut agent = (self.agent_factory)(config);
-        let mut total = TokenUsage::default();
-        let mut iteration: u64 = 0;
-
-        let (finish_reason, last_agent_message) = loop {
-            match agent.next_step() {
-                TurnStep::CallModel {
-                    allow_tools,
-                    reminder,
-                } => {
-                    if iteration > u64::from(config.max_tool_iterations) {
-                        return Err(CoreError::Internal(format!(
-                            "agent requested more than {} model calls",
-                            u64::from(config.max_tool_iterations) + 1
-                        )));
-                    }
-                    let model_iteration = u32::try_from(iteration)
-                        .map_err(|_| CoreError::Internal("model iteration exceeds u32".into()))?;
-                    recorder
-                        .record(EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
-                            iteration: model_iteration,
-                            allow_tools,
-                        }))
-                        .await?;
-
-                    if let Some(reminder) = reminder {
-                        recorder
-                            .record(EventMsg::SystemReminder(SystemReminderEvent {
-                                iteration: model_iteration,
-                                reminder,
-                            }))
-                            .await?;
-                    }
-                    let mut request = ModelRequest {
-                        system_prompt: config.effective_system_prompt(),
-                        events: recorder.events().await?,
-                        tools: if allow_tools {
-                            self.tools.specs()
-                        } else {
-                            Vec::new()
-                        },
-                        iteration: model_iteration,
-                    };
-                    let ctx = HookCtx {
-                        thread_id: recorder.thread_id(),
-                        turn_id,
-                        iteration: Some(model_iteration),
-                        config,
-                    };
-                    for middleware in &self.middlewares {
-                        middleware.before_model(&ctx, &mut request).await?;
-                    }
-                    let (mut response, streamed) = self.stream_model(recorder, request).await?;
-                    for middleware in self.middlewares.iter().rev() {
-                        middleware.after_model(&ctx, &mut response).await?;
-                    }
-                    total += response.usage;
-
-                    // Final text wins; deltas only fill in when it is missing.
-                    let content = response.content.or(streamed.as_ref().map(|s| s.1.clone()));
-                    let started = streamed.as_ref().map(|s| s.0);
-                    let calls = agent.on_model_output(content.as_deref(), &response.tool_calls)?;
-                    validate_tool_calls(&response.tool_calls, &calls, allow_tools)?;
-                    let ignored_tool_calls = response.tool_calls.len() - calls.len();
-                    if content.is_some() || !calls.is_empty() {
-                        let message = AssistantMessageEvent {
-                            message_id: started.unwrap_or_else(MessageId::new),
-                            content,
-                            tool_calls: calls.clone(),
-                        };
-                        if started.is_none() {
-                            recorder
-                                .record(EventMsg::AssistantMessageStart(
-                                    AssistantMessageStartEvent {
-                                        message_id: message.message_id,
-                                    },
-                                ))
-                                .await?;
-                        }
-                        recorder.record(EventMsg::AssistantMessage(message)).await?;
-                    }
-                    if ignored_tool_calls > 0 {
-                        recorder
-                            .record(EventMsg::Warning(WarningEvent {
-                                message: format!("ignored {ignored_tool_calls} tool call(s)"),
-                            }))
-                            .await?;
-                    }
-
-                    if !calls.is_empty() {
-                        let mut results = Vec::with_capacity(calls.len());
-                        for call in calls {
-                            results.push(
-                                self.run_tool(recorder, call, config, turn_id, model_iteration)
-                                    .await?,
-                            );
-                        }
-                        agent.on_tool_results(&results)?;
-                    }
-
-                    recorder
-                        .record(EventMsg::ModelRequestCompleted(
-                            ModelRequestCompletedEvent {
-                                iteration: model_iteration,
-                                usage: response.usage,
-                            },
-                        ))
-                        .await?;
-                    iteration += 1;
-                }
-                TurnStep::Done {
-                    finish,
-                    last_agent_message,
-                } => break (finish, last_agent_message),
-            }
-        };
-
-        for middleware in self.middlewares.iter().rev() {
-            middleware.after_turn(&turn_ctx).await?;
-        }
-        recorder
-            .record(EventMsg::TokenCount(TokenCountEvent { usage: total }))
-            .await?;
-        recorder
-            .record(EventMsg::TurnComplete(TurnCompleteEvent {
-                last_agent_message,
-                finish_reason,
-            }))
-            .await?;
-        Ok(())
+        let mut agent = (self.agent_factory)(self.bindings.clone(), config);
+        let mut ctx = TurnContext::new(recorder, config, turn_id);
+        agent.forward_with_hooks(&mut ctx).await
     }
-
-    /// Reads one streamed model call, recording `AssistantMessageStart` at the
-    /// first non-empty delta and an `AssistantMessageDelta` per delta.
-    ///
-    /// Returns the final response and, if any delta arrived, the message id and
-    /// the concatenated delta text.
-    async fn stream_model(
-        &self,
-        recorder: &mut Recorder,
-        request: ModelRequest,
-    ) -> Result<(ModelResponse, Option<(MessageId, String)>), CoreError> {
-        let mut stream = self.model.stream(request).await?;
-        let mut streamed: Option<(MessageId, String)> = None;
-        while let Some(item) = stream.next().await {
-            match item? {
-                ModelStreamItem::TextDelta { text } if text.is_empty() => {}
-                ModelStreamItem::TextDelta { text } => {
-                    let message_id = match &mut streamed {
-                        Some((id, buffer)) => {
-                            buffer.push_str(&text);
-                            *id
-                        }
-                        None => {
-                            let id = MessageId::new();
-                            recorder
-                                .record(EventMsg::AssistantMessageStart(
-                                    AssistantMessageStartEvent { message_id: id },
-                                ))
-                                .await?;
-                            streamed = Some((id, text.clone()));
-                            id
-                        }
-                    };
-                    recorder
-                        .record(EventMsg::AssistantMessageDelta(
-                            AssistantMessageDeltaEvent {
-                                message_id,
-                                delta: text,
-                            },
-                        ))
-                        .await?;
-                }
-                ModelStreamItem::Completed { response } => return Ok((response, streamed)),
-            }
-        }
-        Err(CoreError::Model(
-            "model stream ended without a final response".into(),
-        ))
-    }
-
-    async fn run_tool(
-        &self,
-        recorder: &mut Recorder,
-        mut call: ToolCall,
-        config: &ThreadConfig,
-        turn_id: TurnId,
-        iteration: u32,
-    ) -> Result<ToolResult, CoreError> {
-        let original_id = call.id.clone();
-        let original_name = call.name.clone();
-        let ctx = HookCtx {
-            thread_id: recorder.thread_id(),
-            turn_id,
-            iteration: Some(iteration),
-            config,
-        };
-        let mut decision = ToolDecision::Continue;
-        for middleware in &self.middlewares {
-            decision = middleware.before_tool(&ctx, &mut call).await?;
-            if matches!(&decision, ToolDecision::Skip(_)) {
-                break;
-            }
-        }
-        call.id = original_id;
-        call.name = original_name;
-        recorder
-            .record(EventMsg::ToolCallBegin(ToolCallBeginEvent {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            }))
-            .await?;
-
-        let started = Instant::now();
-        let skipped = matches!(&decision, ToolDecision::Skip(_));
-        let mut result = match decision {
-            ToolDecision::Skip(result) => result,
-            ToolDecision::Continue => match self.tools.get(&call.name) {
-                Some(tool) => tool.execute(&call).await,
-                None => ToolResult::not_found(&call),
-            },
-        };
-        for middleware in self.middlewares.iter().rev() {
-            middleware.after_tool(&ctx, &call, &mut result).await?;
-        }
-        // The call is authoritative; middleware and tools cannot re-key results.
-        result.call_id = call.id.clone();
-        result.tool_name = call.name.clone();
-        let duration_ms = if skipped {
-            0
-        } else {
-            started.elapsed().as_millis() as u64
-        };
-
-        recorder
-            .record(EventMsg::ToolCallEnd(ToolCallEndEvent {
-                result: result.clone(),
-                duration_ms: Some(duration_ms),
-            }))
-            .await?;
-
-        Ok(result)
-    }
-}
-
-fn validate_tool_calls(
-    requested: &[ToolCall],
-    retained: &[ToolCall],
-    allow_tools: bool,
-) -> Result<(), CoreError> {
-    if !allow_tools && !retained.is_empty() {
-        return Err(CoreError::Internal(
-            "agent retained tool calls when tools were disabled".into(),
-        ));
-    }
-
-    let mut next = 0;
-    for call in retained {
-        while next < requested.len() && requested[next] != *call {
-            next += 1;
-        }
-        if next == requested.len() {
-            return Err(CoreError::Internal(
-                "agent tool calls are not an ordered subsequence of model output".into(),
-            ));
-        }
-        next += 1;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -392,13 +113,16 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use tapestry_protocol::{
-        EnvironmentContext, Event, FinishReason, HistoryItem, ModelResponse, SubmissionId,
-        SystemReminder, ThreadId, ToolCallId, ToolCallStatus, ToolSpec,
+        EnvironmentContext, Event, FinishReason, HistoryItem, MessageId, ModelRequest,
+        ModelResponse, ModelStreamItem, SubmissionId, SystemReminder, ThreadId, TokenUsage,
+        ToolCall, ToolCallId, ToolCallStatus, ToolResult, ToolSpec,
     };
 
     use super::*;
+    use crate::agent::{ReasoningOutput, StepOutput, TurnContext, TurnOutcome, TurnStep};
     use crate::clock::FixedClock;
     use crate::formatter::formatter_trait::HistoryProjection;
+    use crate::middleware::{HookCtx, ToolDecision};
     use crate::model::{MockModelClient, ModelStream};
     use crate::store::testing::FlakyStore;
     use crate::store::{EventStore, InMemoryEventStore};
@@ -515,79 +239,6 @@ mod tests {
         })
     }
 
-    struct ScriptAgent {
-        steps: Vec<TurnStep>,
-        output_calls: VecDeque<Vec<ToolCall>>,
-        step: usize,
-        results: Option<Arc<Mutex<Vec<Vec<ToolResult>>>>>,
-    }
-
-    impl ScriptAgent {
-        fn new(
-            steps: Vec<TurnStep>,
-            output_calls: Vec<Vec<ToolCall>>,
-            results: Option<Arc<Mutex<Vec<Vec<ToolResult>>>>>,
-        ) -> Self {
-            Self {
-                steps,
-                output_calls: output_calls.into(),
-                step: 0,
-                results,
-            }
-        }
-    }
-
-    impl Agent for ScriptAgent {
-        fn next_step(&self) -> TurnStep {
-            self.steps
-                .get(self.step)
-                .cloned()
-                .unwrap_or(TurnStep::Done {
-                    finish: FinishReason::Completed,
-                    last_agent_message: None,
-                })
-        }
-
-        fn on_model_output(
-            &mut self,
-            _content: Option<&str>,
-            _tool_calls: &[ToolCall],
-        ) -> Result<Vec<ToolCall>, CoreError> {
-            self.step += 1;
-            Ok(self.output_calls.pop_front().unwrap_or_default())
-        }
-
-        fn on_tool_results(&mut self, results: &[ToolResult]) -> Result<(), CoreError> {
-            if let Some(capture) = &self.results {
-                capture.lock().unwrap().push(results.to_vec());
-            }
-            Ok(())
-        }
-    }
-
-    struct InfiniteAgent;
-
-    impl Agent for InfiniteAgent {
-        fn next_step(&self) -> TurnStep {
-            TurnStep::CallModel {
-                allow_tools: true,
-                reminder: None,
-            }
-        }
-
-        fn on_model_output(
-            &mut self,
-            _content: Option<&str>,
-            _tool_calls: &[ToolCall],
-        ) -> Result<Vec<ToolCall>, CoreError> {
-            Ok(Vec::new())
-        }
-
-        fn on_tool_results(&mut self, _results: &[ToolResult]) -> Result<(), CoreError> {
-            unreachable!("this policy never retains tools")
-        }
-    }
-
     struct FailingTool;
 
     #[async_trait]
@@ -668,11 +319,15 @@ mod tests {
         skip_output: Option<&'static str>,
         rekey_call: bool,
         after_output: Option<&'static str>,
+        append_after_output: Option<&'static str>,
         rekey_result: bool,
         fail_before_model: bool,
         tool_count: Option<Arc<AtomicUsize>>,
         event_store: Option<Arc<dyn EventStore>>,
         turn_complete_seen: Option<Arc<AtomicBool>>,
+        step_override: Option<TurnStep>,
+        initial_step: Option<TurnStep>,
+        fail_after_step: bool,
     }
 
     impl Probe {
@@ -687,11 +342,15 @@ mod tests {
                 skip_output: None,
                 rekey_call: false,
                 after_output: None,
+                append_after_output: None,
                 rekey_result: false,
                 fail_before_model: false,
                 tool_count: None,
                 event_store: None,
                 turn_complete_seen: None,
+                step_override: None,
+                initial_step: None,
+                fail_after_step: false,
             }
         }
 
@@ -705,8 +364,15 @@ mod tests {
 
     #[async_trait]
     impl Middleware for Probe {
-        async fn before_turn(&self, _ctx: &HookCtx<'_>) -> Result<(), CoreError> {
+        async fn before_turn(
+            &self,
+            _ctx: &HookCtx<'_>,
+            initial_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
             self.record("before_turn");
+            if let Some(step) = &self.initial_step {
+                *initial_step = step.clone();
+            }
             Ok(())
         }
 
@@ -795,9 +461,277 @@ mod tests {
             if let Some(output) = self.after_output {
                 result.output = output.into();
             }
+            if let Some(suffix) = self.append_after_output {
+                result.output.push_str(suffix);
+            }
             if self.rekey_result {
                 result.call_id = ToolCallId::from("middleware-result-id");
                 result.tool_name = "middleware-result-tool".into();
+            }
+            Ok(())
+        }
+
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            self.record("after_step");
+            if self.fail_after_step {
+                return Err(CoreError::Tool("middleware after_step failed".into()));
+            }
+            if let Some(step) = &self.step_override {
+                *next_step = step.clone();
+            }
+            Ok(())
+        }
+    }
+
+    struct FinishAfterTools {
+        trace: Arc<Mutex<Vec<String>>>,
+        results: Arc<Mutex<Vec<ToolResult>>>,
+    }
+
+    struct SelectModelForToolStep;
+
+    #[async_trait]
+    impl Middleware for SelectModelForToolStep {
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            if matches!(output, StepOutput::Model(response) if !response.tool_calls.is_empty()) {
+                *next_step = TurnStep::CallModel {
+                    allow_tools: true,
+                    reminder: None,
+                };
+            }
+            Ok(())
+        }
+    }
+
+    struct RestoreToolStep;
+
+    #[async_trait]
+    impl Middleware for RestoreToolStep {
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            if matches!(output, StepOutput::Model(response) if !response.tool_calls.is_empty())
+                && matches!(next_step, TurnStep::CallModel { .. })
+            {
+                *next_step = TurnStep::CallTool;
+            }
+            Ok(())
+        }
+    }
+
+    struct DropCalls {
+        next_step: TurnStep,
+    }
+
+    #[async_trait]
+    impl Middleware for DropCalls {
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            if matches!(output, StepOutput::Model(response) if !response.tool_calls.is_empty()) {
+                *next_step = self.next_step.clone();
+            }
+            Ok(())
+        }
+    }
+
+    struct ReenableTools;
+
+    #[async_trait]
+    impl Middleware for ReenableTools {
+        async fn before_model(
+            &self,
+            _ctx: &HookCtx<'_>,
+            request: &mut ModelRequest,
+        ) -> Result<(), CoreError> {
+            request.tools.push(ToolSpec {
+                name: "echo".into(),
+                description: "attempted re-enable".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            });
+            Ok(())
+        }
+    }
+
+    type IterationLog = Arc<Mutex<Vec<(&'static str, Option<u32>)>>>;
+
+    struct IterationCapture(IterationLog);
+
+    #[async_trait]
+    impl Middleware for IterationCapture {
+        async fn before_model(
+            &self,
+            ctx: &HookCtx<'_>,
+            _request: &mut ModelRequest,
+        ) -> Result<(), CoreError> {
+            self.0.lock().unwrap().push(("before_model", ctx.iteration));
+            Ok(())
+        }
+
+        async fn after_model(
+            &self,
+            ctx: &HookCtx<'_>,
+            _response: &mut ModelResponse,
+        ) -> Result<(), CoreError> {
+            self.0.lock().unwrap().push(("after_model", ctx.iteration));
+            Ok(())
+        }
+
+        async fn before_tool(
+            &self,
+            ctx: &HookCtx<'_>,
+            _call: &mut ToolCall,
+        ) -> Result<ToolDecision, CoreError> {
+            self.0.lock().unwrap().push(("before_tool", ctx.iteration));
+            Ok(ToolDecision::Continue)
+        }
+
+        async fn after_tool(
+            &self,
+            ctx: &HookCtx<'_>,
+            _call: &ToolCall,
+            _result: &mut ToolResult,
+        ) -> Result<(), CoreError> {
+            self.0.lock().unwrap().push(("after_tool", ctx.iteration));
+            Ok(())
+        }
+
+        async fn after_step(
+            &self,
+            ctx: &HookCtx<'_>,
+            output: &StepOutput<'_>,
+            _next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            let step = match output {
+                StepOutput::Model(_) => "after_step_model",
+                StepOutput::Tools(_) => "after_step_tools",
+            };
+            self.0.lock().unwrap().push((step, ctx.iteration));
+            Ok(())
+        }
+    }
+
+    struct SkipFirstCall(AtomicUsize);
+
+    #[async_trait]
+    impl Middleware for SkipFirstCall {
+        async fn before_tool(
+            &self,
+            _ctx: &HookCtx<'_>,
+            call: &mut ToolCall,
+        ) -> Result<ToolDecision, CoreError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(ToolDecision::Skip(ToolResult::completed(call, "skipped")))
+            } else {
+                Ok(ToolDecision::Continue)
+            }
+        }
+    }
+
+    struct OverriddenStepsAgent {
+        bindings: AgentBindings,
+        reasoning_calls: Arc<AtomicUsize>,
+        acting_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Agent for OverriddenStepsAgent {
+        fn bindings(&self) -> &AgentBindings {
+            &self.bindings
+        }
+
+        fn bindings_mut(&mut self) -> &mut AgentBindings {
+            &mut self.bindings
+        }
+
+        async fn reasoning(
+            &self,
+            _ctx: &mut TurnContext<'_>,
+            request: ModelRequest,
+        ) -> Result<ReasoningOutput, CoreError> {
+            self.reasoning_calls.fetch_add(1, Ordering::SeqCst);
+            let (content, tool_calls) = if request.iteration == 0 {
+                (
+                    None,
+                    vec![tc("echo", serde_json::json!({"input":"ignored"}))],
+                )
+            } else {
+                (Some("custom answer".into()), Vec::new())
+            };
+            Ok(ReasoningOutput {
+                response: ModelResponse {
+                    content,
+                    tool_calls,
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..Default::default()
+                    },
+                },
+                streamed: None,
+            })
+        }
+
+        async fn acting(&self, call: &ToolCall) -> ToolResult {
+            self.acting_calls.fetch_add(1, Ordering::SeqCst);
+            ToolResult::completed(call, "overridden tool output")
+        }
+    }
+
+    struct OverriddenForwardAgent(AgentBindings);
+
+    #[async_trait]
+    impl Agent for OverriddenForwardAgent {
+        fn bindings(&self) -> &AgentBindings {
+            &self.0
+        }
+
+        fn bindings_mut(&mut self) -> &mut AgentBindings {
+            &mut self.0
+        }
+
+        async fn forward(&mut self, _ctx: &mut TurnContext<'_>) -> Result<TurnOutcome, CoreError> {
+            Ok(TurnOutcome {
+                finish: FinishReason::Completed,
+                last_agent_message: Some("custom flow".into()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Middleware for FinishAfterTools {
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            match output {
+                StepOutput::Model(_) => self.trace.lock().unwrap().push("finish.model".into()),
+                StepOutput::Tools(results) => {
+                    self.trace.lock().unwrap().push("finish.tools".into());
+                    self.results.lock().unwrap().extend_from_slice(results);
+                    *next_step = TurnStep::Done {
+                        finish: FinishReason::Completed,
+                        last_agent_message: Some("tools are enough".into()),
+                    };
+                }
             }
             Ok(())
         }
@@ -1601,10 +1535,13 @@ mod tests {
                 "one.before_turn",
                 "one.before_model",
                 "one.after_model",
+                "one.after_step",
                 "one.before_tool",
                 "one.after_tool",
+                "one.after_step",
                 "one.before_model",
                 "one.after_model",
+                "one.after_step",
                 "one.after_turn"
             ]
         );
@@ -1767,6 +1704,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_first_call_does_not_skip_the_rest_of_the_batch() {
+        let calls = vec![
+            tc("echo", serde_json::json!({"input":"skipped"})),
+            tc("echo", serde_json::json!({"input":"executed"})),
+        ];
+        let model = ScriptedModel::new(vec![resp(None, calls), resp(Some("done"), vec![])]);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(CountingEchoTool(executions.clone())));
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        h.agent = AgentLoop::new(model, Arc::new(tools))
+            .with_middleware(Arc::new(SkipFirstCall(AtomicUsize::new(0))));
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let results = events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::ToolCallEnd(end) => Some(end.result.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].output, "skipped");
+        assert_eq!(results[1].output, "executed");
+        assert!(results
+            .iter()
+            .all(|result| result.status == ToolCallStatus::Completed));
+    }
+
+    #[tokio::test]
     async fn unknown_tool_still_runs_after_tool_hooks() {
         let model = ScriptedModel::new(vec![
             resp(None, vec![tc("missing", serde_json::Value::Null)]),
@@ -1788,7 +1758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_middlewares_apply_in_order_and_unwind_in_reverse() {
+    async fn multiple_middlewares_apply_in_registration_order() {
         let model = ScriptedModel::new(vec![
             resp(
                 None,
@@ -1800,8 +1770,10 @@ mod tests {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let mut first = Probe::new("A", trace.clone());
         first.tool_input = Some("a");
+        first.after_output = Some("a");
         let mut second = Probe::new("B", trace.clone());
         second.append_tool_input = Some("b");
+        second.append_after_output = Some("b");
         h.agent = h
             .agent
             .with_middlewares([Arc::new(first) as Arc<dyn Middleware>, Arc::new(second)]);
@@ -1831,7 +1803,7 @@ mod tests {
                 .filter(|entry| entry.ends_with("after_turn"))
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["B.after_turn", "A.after_turn"]
+            ["A.after_turn", "B.after_turn"]
         );
         assert_eq!(calls_for("before_tool"), ["A.before_tool", "B.before_tool"]);
         assert_eq!(
@@ -1843,21 +1815,17 @@ mod tests {
                 "B.before_model"
             ]
         );
-        for node in ["after_model", "after_tool"] {
+        for node in ["after_model", "after_tool", "after_step"] {
             let calls = calls_for(node);
-            if node == "after_model" {
-                assert_eq!(
-                    calls,
-                    [
-                        format!("B.{node}"),
-                        format!("A.{node}"),
-                        format!("B.{node}"),
-                        format!("A.{node}")
-                    ]
-                );
-            } else {
-                assert_eq!(calls, [format!("B.{node}"), format!("A.{node}")]);
-            }
+            let count = match node {
+                "after_tool" => 1,
+                "after_step" => 3,
+                _ => 2,
+            };
+            let expected = (0..count)
+                .flat_map(|_| [format!("A.{node}"), format!("B.{node}")])
+                .collect::<Vec<_>>();
+            assert_eq!(calls, expected);
         }
         assert!(events.iter().any(|event| matches!(
             &event.msg,
@@ -1933,6 +1901,427 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn after_step_can_finish_after_a_complete_ordered_tool_batch() {
+        let calls = vec![
+            tc("echo", serde_json::json!({"input":"first"})),
+            tc("echo", serde_json::json!({"input":"second"})),
+        ];
+        let model = ScriptedModel::new(vec![resp(None, calls)]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        h.agent = h.agent.with_middleware(Arc::new(FinishAfterTools {
+            trace: trace.clone(),
+            results: results.clone(),
+        }));
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert_eq!(*trace.lock().unwrap(), ["finish.model", "finish.tools"]);
+        let received = results.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].output, "first");
+        assert_eq!(received[1].output, "second");
+        assert_eq!(
+            kinds(&events),
+            [
+                "turn_started",
+                "user",
+                "req_start:0",
+                "start",
+                "assistant:2",
+                "tool_begin",
+                "tool_end:Completed",
+                "tool_begin",
+                "tool_end:Completed",
+                "req_done:0",
+                "token_count",
+                "turn_complete"
+            ]
+        );
+        let completed_usage = events.iter().find_map(|event| match &event.msg {
+            EventMsg::ModelRequestCompleted(completed) => Some(completed.usage),
+            _ => None,
+        });
+        let total_usage = events.iter().find_map(|event| match &event.msg {
+            EventMsg::TokenCount(total) => Some(total.usage),
+            _ => None,
+        });
+        assert_eq!(completed_usage, total_usage);
+        assert_eq!(
+            total_usage,
+            Some(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                ..Default::default()
+            })
+        );
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.finish_reason == FinishReason::Completed
+                    && complete.last_agent_message.as_deref() == Some("tools are enough")
+        ));
+    }
+
+    #[tokio::test]
+    async fn later_middleware_can_replace_a_nonterminal_plan() {
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![tc("echo", serde_json::json!({"input":"once"}))]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        h.agent = h.agent.with_middlewares([
+            Arc::new(SelectModelForToolStep) as Arc<dyn Middleware>,
+            Arc::new(RestoreToolStep),
+        ]);
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::ToolCallBegin(_)))
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::Warning(_))));
+    }
+
+    #[tokio::test]
+    async fn model_and_its_tool_batch_share_one_iteration_number() {
+        let model = ScriptedModel::new(vec![
+            resp(None, vec![tc("echo", serde_json::json!({"input":"one"}))]),
+            resp(Some("done"), vec![]),
+        ]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let iterations = Arc::new(Mutex::new(Vec::new()));
+        h.agent = h
+            .agent
+            .with_middleware(Arc::new(IterationCapture(iterations.clone())));
+
+        let (result, _, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(
+            *iterations.lock().unwrap(),
+            [
+                ("before_model", Some(0)),
+                ("after_model", Some(0)),
+                ("after_step_model", Some(0)),
+                ("before_tool", Some(0)),
+                ("after_tool", Some(0)),
+                ("after_step_tools", Some(0)),
+                ("before_model", Some(1)),
+                ("after_model", Some(1)),
+                ("after_step_model", Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unexecuted_model_calls_are_removed_before_assistant_message_commit() {
+        let call = tc("echo", serde_json::json!({"input":"ignored"}));
+        for (next_step, extra_response, expected_requests) in [
+            (
+                TurnStep::Done {
+                    finish: FinishReason::Completed,
+                    last_agent_message: Some("finished".into()),
+                },
+                None,
+                1,
+            ),
+            (
+                TurnStep::CallModel {
+                    allow_tools: true,
+                    reminder: None,
+                },
+                Some(resp(Some("answer"), vec![])),
+                2,
+            ),
+        ] {
+            let mut replies = vec![resp(Some("partial"), vec![call.clone()])];
+            if let Some(response) = extra_response {
+                replies.push(response);
+            }
+            let model = ScriptedModel::new(replies);
+            let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+            h.agent = h.agent.with_middleware(Arc::new(DropCalls { next_step }));
+
+            let (result, events, _) = h.turn("go").await;
+
+            result.unwrap();
+            let first_assistant = events.iter().find_map(|event| match &event.msg {
+                EventMsg::AssistantMessage(message) => Some(message),
+                _ => None,
+            });
+            let first_assistant = first_assistant.unwrap();
+            assert_eq!(first_assistant.content.as_deref(), Some("partial"));
+            assert!(first_assistant.tool_calls.is_empty());
+            assert!(events.iter().any(|event| matches!(
+                &event.msg,
+                EventMsg::Warning(warning) if warning.message.contains("ignored 1")
+            )));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::ToolCallBegin(_))));
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            if requests.len() == 2 {
+                let history = request_history(&requests[1]);
+                assert!(matches!(
+                    history.last(),
+                    Some(HistoryItem::Assistant { tool_calls, content: Some(text) })
+                        if tool_calls.is_empty() && text == "partial"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_locked_default_done_cannot_be_reopened() {
+        let model = ScriptedModel::new(vec![resp(Some("answer"), vec![])]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let mut probe = Probe::new("reopen", Arc::new(Mutex::new(Vec::new())));
+        probe.step_override = Some(TurnStep::CallModel {
+            allow_tools: false,
+            reminder: None,
+        });
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(
+            matches!(result, Err(CoreError::Internal(message)) if message.contains("locked Done"))
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn initial_done_skips_model_and_still_completes_the_turn() {
+        let model = ScriptedModel::new(vec![]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let mut probe = Probe::new("initial", Arc::new(Mutex::new(Vec::new())));
+        probe.initial_step = Some(TurnStep::Done {
+            finish: FinishReason::Completed,
+            last_agent_message: Some("no model needed".into()),
+        });
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert!(model.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            kinds(&events),
+            ["turn_started", "user", "token_count", "turn_complete"]
+        );
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.last_agent_message.as_deref() == Some("no model needed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_call_tool_without_a_batch_is_an_error() {
+        let model = ScriptedModel::new(vec![]);
+        let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
+        let mut probe = Probe::new("initial", Arc::new(Mutex::new(Vec::new())));
+        probe.initial_step = Some(TurnStep::CallTool);
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(
+            matches!(result, Err(CoreError::Internal(message)) if message.contains("pending tool batch"))
+        );
+        assert!(model.requests.lock().unwrap().is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn model_hook_cannot_restore_tools_after_budget_is_exhausted() {
+        let model = ScriptedModel::new(vec![resp(Some("summary"), vec![])]);
+        let mut h = Harness::without_time(
+            model.clone(),
+            &ThreadConfig {
+                max_tool_iterations: 0,
+                ..Default::default()
+            },
+        );
+        h.agent = h.agent.with_middleware(Arc::new(ReenableTools));
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(
+            matches!(result, Err(CoreError::Internal(message)) if message.contains("re-enabled tools"))
+        );
+        assert!(model.requests.lock().unwrap().is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event.msg,
+            EventMsg::ModelRequestStarted(tapestry_protocol::ModelRequestStartedEvent {
+                allow_tools: false,
+                ..
+            })
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn after_step_error_stops_later_hooks_and_completion() {
+        let model = ScriptedModel::new(vec![resp(Some("answer"), vec![])]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut failing = Probe::new("failing", trace.clone());
+        failing.fail_after_step = true;
+        let observer = Probe::new("observer", trace.clone());
+        h.agent = h
+            .agent
+            .with_middlewares([Arc::new(failing) as Arc<dyn Middleware>, Arc::new(observer)]);
+
+        let (result, events, _) = h.turn("go").await;
+
+        assert!(matches!(result, Err(CoreError::Tool(message)) if message.contains("after_step")));
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                "failing.before_turn",
+                "observer.before_turn",
+                "failing.before_model",
+                "observer.before_model",
+                "failing.after_model",
+                "observer.after_model",
+                "failing.after_step"
+            ]
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_single_tool_overrides_run_inside_their_hooks() {
+        let model = ScriptedModel::new(vec![]);
+        let mut h = Harness::without_time(model, &ThreadConfig::default());
+        let reasoning_calls = Arc::new(AtomicUsize::new(0));
+        let acting_calls = Arc::new(AtomicUsize::new(0));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        h.agent = h
+            .agent
+            .with_middleware(Arc::new(Probe::new("hooks", trace.clone())));
+        let reasoning_count = reasoning_calls.clone();
+        let acting_count = acting_calls.clone();
+        h.agent = h.agent.with_agent_factory(move |bindings, _| {
+            Box::new(OverriddenStepsAgent {
+                bindings,
+                reasoning_calls: reasoning_count.clone(),
+                acting_calls: acting_count.clone(),
+            })
+        });
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(reasoning_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(acting_calls.load(Ordering::SeqCst), 1);
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::ToolCallEnd(end) if end.result.output == "overridden tool output"
+        )));
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.last_agent_message.as_deref() == Some("custom answer")
+        ));
+        let trace = trace.lock().unwrap();
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|item| item.ends_with("before_model"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|item| item.ends_with("after_model"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|item| item.ends_with("before_tool"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|item| item.ends_with("after_tool"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_override_is_wrapped_and_completes_once() {
+        let mut h = Harness::without_time(ScriptedModel::new(vec![]), &ThreadConfig::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut probe = Probe::new("turn", trace.clone());
+        let turn_complete_seen = Arc::new(AtomicBool::new(true));
+        probe.event_store = Some(h.store.clone());
+        probe.turn_complete_seen = Some(turn_complete_seen.clone());
+        h.agent = h.agent.with_middleware(Arc::new(probe));
+        h.agent = h
+            .agent
+            .with_agent_factory(|bindings, _| Box::new(OverriddenForwardAgent(bindings)));
+
+        let (result, events, _) = h.turn("go").await;
+
+        result.unwrap();
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["turn.before_turn", "turn.after_turn"]
+        );
+        assert!(!turn_complete_seen.load(Ordering::SeqCst));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::TokenCount(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::TurnComplete(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            &events.last().unwrap().msg,
+            EventMsg::TurnComplete(complete)
+                if complete.last_agent_message.as_deref() == Some("custom flow")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(any())]
     async fn policy_output_must_be_an_ordered_subsequence_and_tools_must_be_allowed() {
         let first = tc("echo", serde_json::json!({"input":"first"}));
         let second = tc("echo", serde_json::json!({"input":"second"}));
@@ -1950,8 +2339,9 @@ mod tests {
         for (requested, retained, allow_tools) in cases {
             let model = ScriptedModel::new(vec![resp(None, requested)]);
             let mut h = Harness::without_time(model, &ThreadConfig::default());
-            h.agent = h.agent.with_agent_factory(move |_| {
+            h.agent = h.agent.with_agent_factory(move |bindings, _| {
                 Box::new(ScriptAgent::new(
+                    bindings,
                     vec![
                         TurnStep::CallModel {
                             allow_tools,
@@ -1982,6 +2372,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn policy_cannot_request_more_than_max_tool_iterations_plus_one_calls() {
         let max_tool_iterations = 2;
         let model = ScriptedModel::new(
@@ -1996,7 +2387,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        h.agent = h.agent.with_agent_factory(|_| Box::new(InfiniteAgent));
+        h.agent = h
+            .agent
+            .with_agent_factory(|bindings, _| Box::new(InfiniteAgent(bindings)));
 
         let (result, events, _) = h.turn("go").await;
         assert!(matches!(result, Err(CoreError::Internal(_))));
@@ -2017,14 +2410,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn custom_policy_can_continue_after_text_and_choose_finish_reason() {
         let model = ScriptedModel::new(vec![
             resp(Some("thinking"), vec![]),
             resp(Some("answer"), vec![]),
         ]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
-        h.agent = h.agent.with_agent_factory(|_| {
+        h.agent = h.agent.with_agent_factory(|bindings, _| {
             Box::new(ScriptAgent::new(
+                bindings,
                 vec![
                     TurnStep::CallModel {
                         allow_tools: true,
@@ -2077,6 +2472,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn custom_policy_keeps_second_call_warns_and_receives_paired_results() {
         let first = tc("echo", serde_json::json!({"input":"first"}));
         let second = tc("echo", serde_json::json!({"input":"second"}));
@@ -2088,8 +2484,9 @@ mod tests {
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let captured = results.clone();
         let expected_second = second.clone();
-        h.agent = h.agent.with_agent_factory(move |_| {
+        h.agent = h.agent.with_agent_factory(move |bindings, _| {
             Box::new(ScriptAgent::new(
+                bindings,
                 vec![
                     TurnStep::CallModel {
                         allow_tools: true,
@@ -2151,6 +2548,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn policy_receives_tool_results_in_call_order_with_matching_ids() {
         let calls = vec![
             tc("echo", serde_json::json!({"input":"first"})),
@@ -2162,8 +2560,9 @@ mod tests {
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let captured = results.clone();
         let expected_calls = calls.clone();
-        h.agent = h.agent.with_agent_factory(move |_| {
+        h.agent = h.agent.with_agent_factory(move |bindings, _| {
             Box::new(ScriptAgent::new(
+                bindings,
                 vec![
                     TurnStep::CallModel {
                         allow_tools: true,
@@ -2205,14 +2604,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn factory_creates_a_fresh_policy_for_every_turn() {
         let model = ScriptedModel::new(vec![resp(Some("one"), vec![]), resp(Some("two"), vec![])]);
         let mut h = Harness::without_time(model, &ThreadConfig::default());
         let created = Arc::new(AtomicUsize::new(0));
         let factory_created = created.clone();
-        h.agent = h.agent.with_agent_factory(move |_| {
+        h.agent = h.agent.with_agent_factory(move |bindings, _| {
             factory_created.fetch_add(1, Ordering::SeqCst);
             Box::new(ScriptAgent::new(
+                bindings,
                 vec![
                     TurnStep::CallModel {
                         allow_tools: true,

@@ -282,12 +282,11 @@ mod tests {
     use std::time::Duration;
 
     use tapestry_protocol::{
-        Event, EventMsg, FinishReason, HistoryItem, ModelRequest, ModelResponse, SystemReminder,
-        ThreadSettings, ToolCall, ToolResult,
+        Event, EventMsg, FinishReason, HistoryItem, ModelRequest, ModelResponse, ThreadSettings,
     };
 
     use super::*;
-    use crate::agent::{Agent, TurnStep};
+    use crate::agent::{Agent, AgentBindings, StepOutput, TurnOutcome, TurnStep};
     use crate::clock::FixedClock;
     use crate::formatter::prompt::render_system_reminder;
     use crate::formatter::{Formatter, OpenAiFormatter};
@@ -435,6 +434,7 @@ mod tests {
     struct ThreadMiddleware {
         tool_calls: Arc<AtomicUsize>,
         fail_before_model: bool,
+        fail_after_step: bool,
     }
 
     #[async_trait::async_trait]
@@ -457,6 +457,18 @@ mod tests {
         ) -> Result<ToolDecision, CoreError> {
             self.tool_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolDecision::Continue)
+        }
+
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _output: &StepOutput<'_>,
+            _next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            if self.fail_after_step {
+                return Err(CoreError::Tool("middleware after_step failure".into()));
+            }
+            Ok(())
         }
     }
 
@@ -643,12 +655,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_middleware_errors_are_recorded_for_the_submission() {
+    async fn after_step_errors_are_recorded_for_the_submission() {
         let model: Arc<dyn ModelClient> = Arc::new(MockModelClient);
         let agent = AgentLoop::new(model.clone(), test_tools()).with_middleware(Arc::new(
             ThreadMiddleware {
                 tool_calls: Arc::new(AtomicUsize::new(0)),
-                fail_before_model: true,
+                fail_before_model: false,
+                fail_after_step: true,
             },
         ));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
@@ -678,6 +691,10 @@ mod tests {
             .unwrap();
         assert_eq!(error.id, submission);
         assert!(error.turn_id.is_some());
+        assert!(matches!(
+            &error.msg,
+            EventMsg::Error(error) if error.message.contains("after_step")
+        ));
         assert!(!events
             .iter()
             .any(|event| matches!(event.msg, EventMsg::TurnComplete(_))));
@@ -691,6 +708,7 @@ mod tests {
             ThreadMiddleware {
                 tool_calls: tool_calls.clone(),
                 fail_before_model: false,
+                fail_after_step: false,
             },
         ));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
@@ -716,45 +734,35 @@ mod tests {
     }
 
     struct ThreadPolicy {
-        finished: bool,
+        bindings: AgentBindings,
     }
 
+    #[async_trait::async_trait]
     impl Agent for ThreadPolicy {
-        fn next_step(&self) -> TurnStep {
-            if self.finished {
-                TurnStep::Done {
-                    finish: FinishReason::ExceedMaxIters,
-                    last_agent_message: Some("selected by policy".into()),
-                }
-            } else {
-                TurnStep::CallModel {
-                    allow_tools: false,
-                    reminder: Some(SystemReminder::ToolLimitReached),
-                }
-            }
+        fn bindings(&self) -> &AgentBindings {
+            &self.bindings
         }
 
-        fn on_model_output(
+        fn bindings_mut(&mut self) -> &mut AgentBindings {
+            &mut self.bindings
+        }
+
+        async fn forward(
             &mut self,
-            _content: Option<&str>,
-            _tool_calls: &[ToolCall],
-        ) -> Result<Vec<ToolCall>, CoreError> {
-            self.finished = true;
-            Ok(Vec::new())
-        }
-
-        fn on_tool_results(&mut self, _results: &[ToolResult]) -> Result<(), CoreError> {
-            Err(CoreError::Internal(
-                "thread policy unexpectedly received tool results".into(),
-            ))
+            _ctx: &mut crate::agent::TurnContext<'_>,
+        ) -> Result<TurnOutcome, CoreError> {
+            Ok(TurnOutcome {
+                finish: FinishReason::ExceedMaxIters,
+                last_agent_message: Some("selected by policy".into()),
+            })
         }
     }
 
     #[tokio::test]
-    async fn thread_uses_custom_policy_from_agent_loop_factory() {
+    async fn thread_uses_custom_forward_from_agent_loop_factory() {
         let model: Arc<dyn ModelClient> = Arc::new(MockModelClient);
         let loop_with_policy = AgentLoop::new(model.clone(), test_tools())
-            .with_agent_factory(|_| Box::new(ThreadPolicy { finished: false }));
+            .with_agent_factory(|bindings, _| Box::new(ThreadPolicy { bindings }));
         let (_thread, handle) = TapestryThread::builder(model, test_tools())
             .agent_loop(loop_with_policy)
             .spawn();

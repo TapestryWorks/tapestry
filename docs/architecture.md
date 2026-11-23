@@ -95,7 +95,7 @@ Repair happens only in the projection (no compensating events): when a turn is c
 | `protocol.rs` — `Submission`, `Op`, `Event`, `EventMsg` | `tapestry-protocol::{submission, event}` | `Command` replaces `Op`; reduced command/event set for v1 |
 | `codex_thread.rs` — thread lifecycle | `tapestry-core::thread` | `TapestryThread`, `ThreadBuilder`, `ThreadHandle` |
 | rollout recording | `tapestry-core::{store, recorder}` | `EventStore`, `InMemoryEventStore`, `EventSubscription`, `Recorder` |
-| `agent/` — turn policy & driver | `tapestry-core::agent` | `Agent` policy (`ReactAgent` by default) + `AgentLoop::forward` (IO driver) |
+| `agent/` — turn policy & driver | `tapestry-core::agent` | `Agent` trait (`reasoning`/`acting`/`forward` + `*_with_hooks`; `ReactAgent` by default) + `AgentLoop::forward` (turn prologue) |
 | conversation history | `tapestry-protocol::model` (`HistoryItem`), `tapestry-core::formatter::formatter_trait` | `HistoryProjection` folds events and repairs unfinished turns |
 | model invocation | `tapestry-protocol::model` (types), `tapestry-core::model` (behavior) | `ChatModel` (`complete`, `stream`), `ResponseModel` (`respond`, `stream`), shared `ModelStream`, and a mock for each trait |
 | provider integrations | `tapestry-core::model::genai` | Provider configuration, request/response mapping, and the genai-backed `GenaiModelClient` |
@@ -135,38 +135,61 @@ adapter -> event
 
 ### State machine and driver
 
-`Agent` is a synchronous, per-turn policy that performs no IO. Its `next_step()` requests a model call or ends the turn; `on_model_output` chooses an unchanged, ordered subsequence of tool calls, and `on_tool_results` receives the paired results. The default `ReactAgent` preserves the usual ReAct behavior. `AgentFactory` creates a fresh policy from the current `ThreadConfig` for every turn.
+`Agent` is an async, per-turn execution interface (`Send + Sync`). Implementors provide `AgentBindings` (model, `ToolRegistry`, middleware); the default methods implement the standard ReAct driver and can be overridden at three levels:
 
-`AgentLoop` is the async driver: it owns the model, tool, middleware, clock and event-store interactions, counts model iterations, and records all events through the `Recorder`. Before each model call it reads a fresh immutable event snapshot. The driver validates that retained calls are an exact ordered subsequence of the model output, rejects retained calls when tools are disabled, enforces a `max_tool_iterations + 1` model-call ceiling, and emits warnings for dropped calls. It executes the retained calls inline so `ModelRequestCompleted(i)` still encloses that iteration's assistant and tool events. Policies cannot access the recorder or bypass these event invariants.
+- `reasoning(ctx, request: ModelRequest)` is the single model execution point. Its default implementation consumes `ModelClient::stream`, records text deltas, and returns a `ReasoningOutput`. It does not expose a `Recorder` to the model implementation.
+- `acting(call: &ToolCall)` is the single-tool execution point. Its default implementation calls the matching registered tool and returns `NotFound` for unknown tools.
+- `forward(ctx) -> TurnOutcome` is the unified default scheduler for the closed `TurnStep::{CallModel, CallTool, Done}` set. `CallTool` consumes the single complete, ordered batch stored in `TurnContext`; it cannot be repeated or fabricated. A custom `forward` can define a different flow while keeping the standard `forward_with_hooks` wrapper.
 
-**Breaking migration:** replace custom `Agent::forward` implementations that performed whole turns with a synchronous per-turn `Agent` policy, then install it with `AgentLoop::with_agent_factory`. Inject the configured driver with `ThreadBuilder::agent_loop(AgentLoop)`. Use middleware for request/response/tool transformations; the policy itself must not perform IO or record events.
+The standard path is `AgentLoop::forward` -> `Agent::forward_with_hooks` -> `Agent::forward`. `forward_with_hooks` applies `before_turn`, calls the overridable `self.forward`, then applies `after_turn` and records exactly one `TokenCount`/`TurnComplete`. The default `forward` itself uses the hooked model and tool steps, so calling `forward` does not disable middleware. It returns an outcome and does not record turn completion.
+
+`TurnContext` is per-turn state: it carries the `Recorder`, `ThreadConfig`, `TurnId`, iteration, accumulated usage, initial plan, pending tool batch and open model iteration. A model iteration remains open while its complete tool batch executes; `ModelRequestCompleted(i)` is emitted only after the batch-level scheduling decision. Model calls are capped at `max_tool_iterations + 1`; the last default call has tools disabled and carries `ToolLimitReached`.
+
+A custom `forward` is responsible for preserving the same observable event and budget contracts for work it performs. `TurnContext::begin_model_iteration`, `set_model_usage` and `finish_model_iteration` provide the shared model-boundary and single-use accounting operations; pending batches likewise have explicit set/take methods.
+
+The model step builds a request snapshot, runs `before_model`, calls `self.reasoning(ctx, request)`, then runs `after_model`. The tool-batch wrapper calls `before_tool`, records `ToolCallBegin`, invokes `self.acting(call)` (or uses a `Skip` result), runs `after_tool`, re-keys the result to the original call and records `ToolCallEnd` for each call in order. A failure stops the batch; a failed/not-found/skipped result by itself does not.
+
+After each successful model step and each complete tool batch, the scheduler computes a default next step and runs `after_step` with a read-only `StepOutput` and that mutable plan. Later middleware can replace a nonterminal plan. `Done` is locked when it is the default or first selected; later middleware still observes it but cannot change the termination or its outcome. Invalid transitions are runtime errors. If the selected model step does not execute its returned tool calls, the complete assistant message omits those calls, preserves text and records a warning with the ignored count. This avoids dangling calls in history.
+
+`AgentLoop` starts turns: it records `TurnStarted`, the optional environment context and the user message, then creates a fresh agent with its `AgentFactory` (`Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent>`, receiving the loop's model, tools and middleware) and runs `forward_with_hooks`. Install custom agents with `AgentLoop::with_agent_factory` and inject the configured loop with `ThreadBuilder::agent_loop(AgentLoop)`.
 
 ### Middleware hooks
 
-`AgentLoop` accepts zero or more `Arc<dyn Middleware>` values through
-`with_middleware` / `with_middlewares`; the existing constructors default to
-none. `HookCtx` provides the thread id, turn id, optional model/tool iteration,
-and read-only thread configuration. Middleware cannot access the `Recorder`,
-and hook execution itself never adds events.
+Middleware is bound to an agent through `AgentBindings` or
+`Agent::bind_middleware`; `AgentLoop::with_middleware` / `with_middlewares`
+bind it to every agent the loop creates, and the constructors default to none.
+All hooks run in middleware registration order, including `after_turn`,
+`after_model`, `after_tool` and `after_step`. `HookCtx` provides the thread id,
+turn id, optional model/tool iteration and read-only thread configuration.
+Middleware cannot access the `Recorder`; hooks do not add events directly.
 
-Before hooks run in registration order; after hooks unwind in reverse order:
-
-- `before_turn` runs after `TurnStarted`, before environment context and user
-  message recording. `after_turn` runs after the model/tool loop, before
-  `TokenCount` and `TurnComplete`.
+- `before_turn` runs after `TurnStarted`, optional environment context and
+  `UserMessage`, and can change the initial step. Selecting `Done` skips model
+  and tool work; `after_turn` still runs before completion events.
 - `before_model` runs after the request snapshot is assembled and before
-  `ModelClient::stream`; `after_model` runs after the final response and before
-  assistant output is passed to the turn policy. Rewritten final content,
-  tool calls, and usage drive subsequent events/history; already-recorded text
-  deltas are unchanged.
+  `self.reasoning`; `after_model` runs after the final response, before the
+  default plan is computed. Rewritten content, tool calls and usage feed
+  scheduling and history. Already-recorded text deltas are not rolled back:
+  `after_model` and `after_step` are not streaming review barriers.
 - `before_tool` runs before `ToolCallBegin`. It may rewrite arguments or return
-  `ToolDecision::Skip(result)` to bypass execution and later before-tool hooks.
-  The original call id and name are restored before recording/execution.
-  `after_tool` runs before `ToolCallEnd`, including for skipped and unknown
-  tools; result id and name are restored from the original call afterward.
+  `ToolDecision::Skip(result)` to bypass execution and the remaining
+  `before_tool` hooks for that call. The original call id and name are restored
+  before recording and invoking `self.acting`. `after_tool` runs before
+  `ToolCallEnd`, including for skipped and unknown tools; result id and name are
+  restored from the original call afterward.
+- `after_step` runs once after a successful model response or complete tool
+  batch, with the post-data-hook result and default next step. It can normally
+  end after the batch, but cannot interrupt a batch or reopen `Done`.
 - Any hook error stops the turn and propagates to the thread worker, which
   records the submission-scoped `Error`. `after_turn` is not called after a
   prior hook or runtime error.
+
+Migration from the former synchronous `next_step`/`on_model_output`/
+`on_tool_results` policy is to override `forward` for a genuinely custom flow,
+or use `after_step` to adjust the standard scheduler. Override `reasoning` for
+model behavior and `acting` for one tool call; their `*_with_hooks` wrappers
+continue to run. The old reverse order for post-hooks is replaced by
+registration order.
 
 Middleware-owned state is retained by the middleware instance (for example
 through atomics or a mutex), is not stored in the event log, and is not restored
@@ -233,27 +256,38 @@ sequenceDiagram
     participant Client
     participant Thread as TapestryThread
     participant Loop as AgentLoop
-    participant Policy as Agent
+    participant Agent
     participant Model as ModelClient
     participant Tools as ToolRegistry
+    participant MW as Middleware
 
     Client->>Thread: Command::UpdateSettings (first)
     Thread-->>Client: SessionConfigured
 
     Client->>Thread: Command::StartTurn
     Thread-->>Client: TurnStarted, UserMessage
+    Thread->>Agent: create per-turn Agent and TurnContext
+    Agent->>MW: before_turn(initial_step)
     loop until Done
-        Loop->>Policy: next_step()
-        Loop->>Model: stream(history, tools)
-        Loop-->>Client: AssistantMessageStart / AssistantMessageDelta*
-        Loop->>Policy: on_model_output
-        Loop-->>Client: AssistantMessage
-        opt tool calls
-            Loop->>Tools: execute
-            Loop-->>Client: ToolCallBegin / ToolCallEnd
-            Loop->>Policy: on_tool_results
+        alt CallModel
+            Agent->>MW: before_model(request)
+            Agent->>Model: reasoning(ModelRequest)
+            Agent->>MW: after_model(response)
+            Agent->>MW: after_step(Model response, next_step)
+            Agent-->>Client: AssistantMessageStart / AssistantMessageDelta* / AssistantMessage
+        else CallTool
+            loop each call in complete ordered batch
+                Agent->>MW: before_tool
+                Loop-->>Client: ToolCallBegin
+                Agent->>Tools: acting(single call)
+                Agent->>MW: after_tool
+                Loop-->>Client: ToolCallEnd
+            end
+            Agent->>MW: after_step(complete tool results, next_step)
         end
     end
+    Note over Agent,Loop: ModelRequestCompleted(i) closes after the model's full tool batch and its step hook
+    Agent->>MW: after_turn
     Loop-->>Client: TokenCount
     Loop-->>Client: TurnComplete
 ```
@@ -290,7 +324,7 @@ sequenceDiagram
 ## Testing strategy
 
 - **Protocol:** serde round-trip unit tests for every public request/event type
-- **Core:** `ReactAgent` is unit-tested without IO; `AgentLoop` tests cover custom policies, driver invariants and event ordering with scripted models; `InMemoryEventStore` and `HistoryProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word); scripted stream clients cover delta, fallback and mid-stream failure cases
+- **Core:** `TurnContext` tests cover per-turn state and single-use tool batches; `AgentLoop` tests cover overridden reasoning/tool/forward methods, middleware registration order, `after_step` scheduling and early finish, tool-budget and event invariants, and scripted model streams; `InMemoryEventStore` and `HistoryProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word)
 - **Integration:** `TapestryThread` end-to-end tests via `ThreadHandle` and `EventSubscription`, including resume from a stored log
 
 Run locally:

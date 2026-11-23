@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use tapestry_protocol::{ModelRequest, ModelResponse, ThreadId, ToolCall, ToolResult, TurnId};
 
+use crate::agent::{StepOutput, TurnStep};
 use crate::config::ThreadConfig;
 use crate::error::CoreError;
 
@@ -25,11 +26,15 @@ pub enum ToolDecision {
 
 /// Async extension hooks around agent turns, model calls, and tool calls.
 ///
-/// Before hooks run in registration order and after hooks run in reverse
-/// registration order. Middleware state belongs to the middleware instance.
+/// Every hook runs in registration order. Middleware state belongs to the
+/// middleware instance.
 #[async_trait]
 pub trait Middleware: Send + Sync {
-    async fn before_turn(&self, _ctx: &HookCtx<'_>) -> Result<(), CoreError> {
+    async fn before_turn(
+        &self,
+        _ctx: &HookCtx<'_>,
+        _initial_step: &mut TurnStep,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
 
@@ -71,6 +76,15 @@ pub trait Middleware: Send + Sync {
     ) -> Result<(), CoreError> {
         Ok(())
     }
+
+    async fn after_step(
+        &self,
+        _ctx: &HookCtx<'_>,
+        _output: &StepOutput<'_>,
+        _next_step: &mut TurnStep,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +106,24 @@ mod tests {
             request: &mut ModelRequest,
         ) -> Result<(), CoreError> {
             request.system_prompt = Some("patched".into());
+            Ok(())
+        }
+    }
+
+    struct StepHook;
+
+    #[async_trait]
+    impl Middleware for StepHook {
+        async fn after_step(
+            &self,
+            _ctx: &HookCtx<'_>,
+            _output: &StepOutput<'_>,
+            next_step: &mut TurnStep,
+        ) -> Result<(), CoreError> {
+            *next_step = TurnStep::Done {
+                finish: tapestry_protocol::FinishReason::Completed,
+                last_agent_message: Some("done".into()),
+            };
             Ok(())
         }
     }
@@ -122,7 +154,16 @@ mod tests {
         let mut result = ToolResult::completed(&call, "x");
         let original_result = result.clone();
 
-        middleware.before_turn(&ctx).await.unwrap();
+        middleware
+            .before_turn(
+                &ctx,
+                &mut TurnStep::CallModel {
+                    allow_tools: true,
+                    reminder: None,
+                },
+            )
+            .await
+            .unwrap();
         middleware.after_turn(&ctx).await.unwrap();
         assert_eq!(
             middleware.before_tool(&ctx, &mut call).await.unwrap(),
@@ -149,5 +190,33 @@ mod tests {
         assert_eq!(request.system_prompt.as_deref(), Some("patched"));
         assert!(request.events.is_empty());
         assert!(request.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_after_step_implementation_is_sufficient() {
+        let config = ThreadConfig::default();
+        let ctx = HookCtx {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            iteration: Some(0),
+            config: &config,
+        };
+        let middleware = StepHook;
+        let mut next = TurnStep::CallModel {
+            allow_tools: true,
+            reminder: None,
+        };
+        middleware
+            .after_step(&ctx, &StepOutput::Tools(&[]), &mut next)
+            .await
+            .unwrap();
+        assert_eq!(
+            next,
+            TurnStep::Done {
+                finish: tapestry_protocol::FinishReason::Completed,
+                last_agent_message: Some("done".into()),
+            }
+        );
+        middleware.after_turn(&ctx).await.unwrap();
     }
 }

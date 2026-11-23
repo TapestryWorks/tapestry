@@ -17,7 +17,10 @@ pub mod thread;
 pub mod tool;
 
 pub use agent::AgentLoop;
-pub use agent::{Agent, AgentFactory, ReactAgent, TurnStep};
+pub use agent::{
+    Agent, AgentBindings, AgentFactory, ReactAgent, ReasoningOutput, StepOutput, StreamedMessage,
+    TurnContext, TurnOutcome, TurnStep,
+};
 pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
 pub use config::ThreadConfig;
 pub use error::CoreError;
@@ -73,7 +76,13 @@ mod compatibility_tests {
 
     #[test]
     fn react_agent_matches_the_agent_trait() {
-        let agent = crate::ReactAgent::new(3);
+        let agent = crate::ReactAgent::new(
+            crate::AgentBindings::new(
+                std::sync::Arc::new(crate::MockModelClient),
+                std::sync::Arc::new(crate::ToolRegistry::new()),
+            ),
+            3,
+        );
         let _: &dyn crate::Agent = &agent;
         let _: &dyn crate::agent::agent_trait::Agent = &agent;
         fn assert_factory(_: crate::AgentFactory) {}
