@@ -103,13 +103,16 @@ pub struct TurnContext<'a> {
     usage: TokenUsage,
     open_iteration: Option<u32>,
     open_usage: Option<TokenUsage>,
-    initial_step: Option<TurnStep>,
+    /// First scheduler step for this turn; default at [`TurnContext::new`], then mutable by `before_turn`.
+    pub initial_step: TurnStep,
     tool_batch: Option<Vec<ToolCall>>,
     reminders: Arc<ReminderQueue>,
 }
 
 impl<'a> TurnContext<'a> {
     pub fn new(recorder: &'a mut Recorder, config: &'a ThreadConfig, turn_id: TurnId) -> Self {
+        let reminders = Arc::new(ReminderQueue::default());
+        let initial_step = Self::initial_call_model_step(0, config, &reminders);
         Self {
             recorder,
             config,
@@ -119,10 +122,27 @@ impl<'a> TurnContext<'a> {
             usage: TokenUsage::default(),
             open_iteration: None,
             open_usage: None,
-            initial_step: None,
+            initial_step,
             tool_batch: None,
-            reminders: Arc::new(ReminderQueue::default()),
+            reminders,
         }
+    }
+
+    /// Default first scheduler step for [`TurnContext::iteration`]; queues a limit reminder when tools are disallowed.
+    pub fn default_initial_step(&self) -> TurnStep {
+        Self::initial_call_model_step(self.iteration(), self.config, &self.reminders)
+    }
+
+    fn initial_call_model_step(
+        iteration: u32,
+        config: &ThreadConfig,
+        reminders: &ReminderQueue,
+    ) -> TurnStep {
+        let allow_tools = iteration < config.max_tool_iterations;
+        if !allow_tools {
+            reminders.push(SystemReminder::ToolLimitReached);
+        }
+        TurnStep::CallModel { allow_tools }
     }
 
     /// Zero-based index of the next model call.
@@ -173,16 +193,6 @@ impl<'a> TurnContext<'a> {
             );
         }
         Ok(events)
-    }
-
-    /// Set the plan selected by the turn-level `before_turn` hooks.
-    pub fn set_initial_step(&mut self, step: TurnStep) {
-        self.initial_step = Some(step);
-    }
-
-    /// Consume the turn-level plan. It cannot be consumed twice.
-    pub fn take_initial_step(&mut self) -> Option<TurnStep> {
-        self.initial_step.take()
     }
 
     /// Whether an ordered tool batch is waiting to be executed.
@@ -435,14 +445,7 @@ pub trait Agent: Send + Sync {
     /// This method does not run turn hooks or record completion events, but
     /// it does run model, tool, and step hooks.
     async fn forward(&mut self, ctx: &mut TurnContext<'_>) -> Result<TurnOutcome, CoreError> {
-        let mut step = match ctx.take_initial_step() {
-            Some(step) => step,
-            None => {
-                let step = initial_step(ctx);
-                ctx.flush_reminders().await?;
-                step
-            }
-        };
+        let mut step = ctx.initial_step.clone();
 
         loop {
             match step {
@@ -550,11 +553,9 @@ pub trait Agent: Send + Sync {
     /// Runs turn hooks around the overridable flow and records completion once.
     async fn forward_with_hooks(&mut self, ctx: &mut TurnContext<'_>) -> Result<(), CoreError> {
         let hook_ctx = ctx.hook_ctx(None);
-        let mut initial = initial_step(ctx);
         for middleware in self.middlewares() {
-            middleware.before_turn(&hook_ctx, &mut initial).await?;
+            middleware.before_turn(&hook_ctx, &mut ctx.initial_step).await?;
         }
-        ctx.set_initial_step(initial);
         ctx.flush_reminders().await?;
         let outcome = self.forward(ctx).await?;
         for middleware in self.middlewares() {
@@ -609,15 +610,6 @@ pub trait Agent: Send + Sync {
 
 /// Creates a fresh per-turn agent from its bindings and the thread configuration.
 pub type AgentFactory = Arc<dyn Fn(AgentBindings, &ThreadConfig) -> Box<dyn Agent> + Send + Sync>;
-
-/// First step of a turn; queues the limit reminder when no tool call is allowed.
-fn initial_step(ctx: &TurnContext<'_>) -> TurnStep {
-    let allow_tools = ctx.iteration() < ctx.config.max_tool_iterations;
-    if !allow_tools {
-        ctx.remind(SystemReminder::ToolLimitReached);
-    }
-    TurnStep::CallModel { allow_tools }
-}
 
 async fn record_assistant_message(
     ctx: &mut TurnContext<'_>,
@@ -733,15 +725,11 @@ mod tests {
         let config = ThreadConfig::default();
         let mut ctx = TurnContext::new(&mut recorder, &config, TurnId::new());
 
-        ctx.set_initial_step(TurnStep::Done {
+        ctx.initial_step = TurnStep::Done {
             finish: FinishReason::Completed,
             last_agent_message: None,
-        });
-        assert!(matches!(
-            ctx.take_initial_step(),
-            Some(TurnStep::Done { .. })
-        ));
-        assert!(ctx.take_initial_step().is_none());
+        };
+        assert!(matches!(ctx.initial_step, TurnStep::Done { .. }));
 
         let calls = vec![ToolCall::new(
             ToolCallId::from("a"),
