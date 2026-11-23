@@ -16,6 +16,26 @@ This repository contains the first-version agent kernel inspired by [OpenAI Code
 | [`tapestry-adapter-a2a`](crates/tapestry-adapter-a2a) | Tapestry event stream to A2A 1.0 streaming responses |
 | [`tapestry-cli`](crates/tapestry-cli) | Run one agent turn and stream its events in the terminal |
 
+## Pre-commit formatting
+
+This repository uses [pre-commit](https://pre-commit.com/) to run
+`cargo fmt --all` before commits containing Rust files.
+
+Install once per clone (requires Rust/Cargo and Python/pip):
+
+```bash
+python3 -m pip install pre-commit
+pre-commit install
+```
+
+When formatting changes a file, pre-commit stops the commit so you can review
+the diff, stage the formatted files, and commit again. This avoids automatically
+staging unrelated edits. Run `pre-commit run --all-files` to check manually,
+or `pre-commit uninstall` to remove the hook.
+
+If you previously installed the custom hook from an earlier revision of this PR,
+run `git config --local --unset core.hooksPath` before `pre-commit install`.
+
 ## Quick start
 
 ```bash
