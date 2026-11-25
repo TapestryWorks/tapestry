@@ -7,3 +7,10 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        files: '(\.rs$|\.toml$|(^|/)Cargo\.lock$|(^|/)rust-toolchain$|^\.pre-commit-config\.yaml$)'
+        pass_filenames: false
