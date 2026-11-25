@@ -651,7 +651,7 @@ pub trait Agent: Send + Sync {
             }
         }
         let next_model_iteration = if ctx.model_iteration_started {
-            ctx.iteration().checked_add(1).unwrap_or(u32::MAX)
+            ctx.iteration().saturating_add(1)
         } else {
             ctx.iteration()
         };
