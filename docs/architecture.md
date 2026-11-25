@@ -139,17 +139,17 @@ adapter -> event
 
 - `reasoning(ctx, request: ModelRequest)` is the single model execution point. Its default implementation consumes `ModelClient::stream`, records text deltas, and returns a `ReasoningOutput`. It does not expose a `Recorder` to the model implementation.
 - `acting(call: &ToolCall)` is the single-tool execution point. Its default implementation calls the matching registered tool and returns `NotFound` for unknown tools.
-- `forward(ctx) -> TurnOutcome` is the unified default scheduler for the closed `TurnStep::{CallModel, CallTool, Done}` set. `CallTool` consumes the single complete, ordered batch stored in `TurnContext`; it cannot be repeated or fabricated. A custom `forward` can define a different flow while keeping the standard `forward_with_hooks` wrapper.
+- `forward(ctx) -> TurnOutcome` is the unified default scheduler for the closed `TurnStep::{CallModel, CallTool, Done}` set. `CallTool` consumes the pending tool calls stored in `TurnContext`; it cannot be repeated or fabricated. A custom `forward` can define a different flow while keeping the standard `forward_with_hooks` wrapper.
 
 The standard path is `AgentLoop::forward` -> `Agent::forward_with_hooks` -> `Agent::forward`. `forward_with_hooks` applies `before_turn`, calls the overridable `self.forward`, then applies `after_turn` and records exactly one `TokenCount`/`TurnComplete`. The default `forward` itself uses the hooked model and tool steps, so calling `forward` does not disable middleware. It returns an outcome and does not record turn completion.
 
-`TurnContext` is per-turn state: it carries the `Recorder`, `ThreadConfig`, `TurnId`, iteration, accumulated usage, initial plan, pending tool batch, open model iteration and a reminder queue. `remind(reminder)` queues a `SystemReminder`; `flush_reminders()` records the queued reminders in order, one `SystemReminder` event each. A model iteration remains open while its complete tool batch executes; `ModelRequestCompleted(i)` is emitted only after the batch-level scheduling decision. Model calls are capped at `max_tool_iterations + 1`; the last default call has tools disabled and follows a `ToolLimitReached` reminder.
+`TurnContext` is per-turn state: it carries the `Recorder`, `ThreadConfig`, `TurnId`, iteration, accumulated usage, initial plan, `pending_tool_calls`, whether a model iteration has started, and a reminder queue. `remind(reminder)` queues a `SystemReminder`; `flush_reminders()` records the queued reminders in order, one `SystemReminder` event each. A model iteration stays started while its pending tool calls execute; `ModelRequestCompleted(i)` is emitted only after the scheduling decision for those calls. Model calls are capped at `max_tool_iterations + 1`; the last default call has tools disabled and follows a `ToolLimitReached` reminder.
 
-A custom `forward` is responsible for preserving the same observable event and budget contracts for work it performs. `TurnContext::begin_model_iteration`, `set_model_usage` and `finish_model_iteration` provide the shared model-boundary and single-use accounting operations; pending batches likewise have explicit set/take methods.
+A custom `forward` is responsible for preserving the same observable event and budget contracts for work it performs. `TurnContext::begin_model_iteration` and `finish_model_iteration` provide the shared model-boundary operations; `finish_model_iteration` records `ModelRequestCompleted` and adds that call's usage to the turn total. Pending tool calls likewise have explicit set/take methods.
 
-The model step records `ModelRequestStarted`, flushes queued reminders, reads the event snapshot, runs the read-only `before_model` hooks, flushes again and appends those reminders to the snapshot, calls `self.reasoning(ctx, request)`, then runs the read-only `after_model` hooks. The tool-batch wrapper calls `before_tool`, records `ToolCallBegin`, invokes `self.acting(call)` (or uses a `Skip` result), runs `after_tool`, re-keys the result to the original call and records `ToolCallEnd` for each call in order. A failure stops the batch; a failed/not-found/skipped result by itself does not.
+The model step records `ModelRequestStarted`, flushes queued reminders, reads the event snapshot, runs the read-only `before_model` hooks, flushes again and appends those reminders to the snapshot, calls `self.reasoning(ctx, request)`, then runs the read-only `after_model` hooks. The tool-call wrapper calls `before_tool`, records `ToolCallBegin`, invokes `self.acting(call)` (or uses a `Skip` result), runs `after_tool`, re-keys the result to the original call and records `ToolCallEnd` for each call in order. A failure stops the remaining calls; a failed/not-found/skipped result by itself does not.
 
-After each successful model step and each complete tool batch, the scheduler computes a default next step and runs `after_step` with a read-only `StepOutput` and that mutable plan. Later middleware can replace a nonterminal plan. `Done` is locked when it is the default or first selected; later middleware still observes it but cannot change the termination or its outcome. Invalid transitions are runtime errors. If the selected model step does not execute its returned tool calls, the complete assistant message omits those calls, preserves text and records a warning with the ignored count. This avoids dangling calls in history.
+After each successful model step and each execution of the pending tool calls, the scheduler computes a default next step and runs `after_step` with a read-only `StepOutput` and that mutable plan. Later middleware can replace a nonterminal plan. `Done` is locked when it is the default or first selected; later middleware still observes it but cannot change the termination or its outcome. Invalid transitions are runtime errors. If the selected model step does not execute its returned tool calls, the complete assistant message omits those calls, preserves text and records a warning with the ignored count. This avoids dangling calls in history.
 
 `AgentLoop` starts turns: it records `TurnStarted`, the optional environment context and the user message, then creates a fresh agent with its `AgentFactory` (`Fn(AgentDeps, &ThreadConfig) -> Box<dyn Agent>`, receiving the loop's model, tools and middleware) and runs `forward_with_hooks`. Install custom agents with `AgentLoop::with_agent_factory` and inject the configured loop with `ThreadBuilder::agent_loop(AgentLoop)`.
 
@@ -301,7 +301,7 @@ sequenceDiagram
             Agent->>MW: after_step(complete tool results, next_step)
         end
     end
-    Note over Agent,Loop: ModelRequestCompleted(i) closes after the model's full tool batch and its step hook
+    Note over Agent,Loop: ModelRequestCompleted(i) closes after the model's tool calls and its step hook
     Agent->>MW: after_turn
     Loop-->>Client: TokenCount
     Loop-->>Client: TurnComplete
@@ -339,7 +339,7 @@ sequenceDiagram
 ## Testing strategy
 
 - **Protocol:** serde round-trip unit tests for every public request/event type
-- **Core:** `TurnContext` tests cover per-turn state and single-use tool batches; `AgentLoop` tests cover overridden reasoning/tool/forward methods, middleware registration order, `after_step` scheduling and early finish, tool-budget and event invariants, and scripted model streams; `InMemoryEventStore` and `ConversationProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word)
+- **Core:** `TurnContext` tests cover per-turn state and single-use pending tool calls; `AgentLoop` tests cover overridden reasoning/tool/forward methods, middleware registration order, `after_step` scheduling and early finish, tool-budget and event invariants, and scripted model streams; `InMemoryEventStore` and `ConversationProjection` have their own unit tests (ordering, replay, repair); `MockModelClient` drives deterministic paths (echo + tool loop, streamed word by word)
 - **Integration:** `TapestryThread` end-to-end tests via `ThreadHandle` and `EventSubscription`, including resume from a stored log
 
 Run locally:

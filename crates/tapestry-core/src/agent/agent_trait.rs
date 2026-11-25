@@ -24,7 +24,7 @@ pub enum TurnStep {
     CallModel {
         allow_tools: bool,
     },
-    /// Execute the complete, ordered tool batch stored in [`TurnContext`].
+    /// Execute the pending tool calls stored in [`TurnContext`].
     CallTool,
     Done {
         finish: FinishReason,
@@ -32,7 +32,7 @@ pub enum TurnStep {
     },
 }
 
-/// Result produced by a successful model or complete tool-batch step.
+/// Result produced by a successful model step or by executing the pending tool calls.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutput<'a> {
     Model(&'a ModelResponse),
@@ -98,14 +98,13 @@ pub struct TurnContext<'a> {
     pub recorder: &'a mut Recorder,
     pub config: &'a ThreadConfig,
     pub turn_id: TurnId,
+    /// First scheduler step for this turn; default at [`TurnContext::new`], then mutable by `before_turn`.
+    pub initial_step: TurnStep,
     iteration: u32,
     model_calls: u64,
     usage: TokenUsage,
-    open_iteration: Option<u32>,
-    open_usage: Option<TokenUsage>,
-    /// First scheduler step for this turn; default at [`TurnContext::new`], then mutable by `before_turn`.
-    pub initial_step: TurnStep,
-    tool_batch: Option<Vec<ToolCall>>,
+    model_iteration_started: bool,
+    pending_tool_calls: Option<Vec<ToolCall>>,
     reminders: Arc<ReminderQueue>,
 }
 
@@ -120,10 +119,9 @@ impl<'a> TurnContext<'a> {
             iteration: 0,
             model_calls: 0,
             usage: TokenUsage::default(),
-            open_iteration: None,
-            open_usage: None,
+            model_iteration_started: false,
             initial_step,
-            tool_batch: None,
+            pending_tool_calls: None,
             reminders,
         }
     }
@@ -153,10 +151,6 @@ impl<'a> TurnContext<'a> {
     /// Number of model calls started in this turn.
     pub fn model_calls(&self) -> u64 {
         self.model_calls
-    }
-
-    pub fn open_model_iteration(&self) -> Option<u32> {
-        self.open_iteration
     }
 
     /// Token usage summed over the model calls completed so far.
@@ -195,32 +189,30 @@ impl<'a> TurnContext<'a> {
         Ok(events)
     }
 
-    /// Whether an ordered tool batch is waiting to be executed.
-    pub fn has_tool_batch(&self) -> bool {
-        self.tool_batch.is_some()
+    /// Whether pending tool calls are waiting to be executed.
+    pub fn has_pending_tool_calls(&self) -> bool {
+        self.pending_tool_calls.is_some()
     }
 
-    /// Store one not-yet-executed batch. A prior batch must first be consumed.
-    pub fn set_tool_batch(&mut self, calls: Vec<ToolCall>) -> Result<(), CoreError> {
+    /// Store tool calls that have not been executed. Existing pending calls must first be consumed.
+    pub fn set_pending_tool_calls(&mut self, calls: Vec<ToolCall>) -> Result<(), CoreError> {
         if calls.is_empty() {
             return Err(CoreError::Internal(
-                "cannot store an empty tool batch".into(),
+                "cannot store empty pending tool calls".into(),
             ));
         }
-        if self.tool_batch.is_some() {
-            return Err(CoreError::Internal(
-                "a tool batch is already pending".into(),
-            ));
+        if self.pending_tool_calls.is_some() {
+            return Err(CoreError::Internal("tool calls are already pending".into()));
         }
-        self.tool_batch = Some(calls);
+        self.pending_tool_calls = Some(calls);
         Ok(())
     }
 
-    /// Consume the pending batch exactly once.
-    pub fn take_tool_batch(&mut self) -> Result<Vec<ToolCall>, CoreError> {
-        self.tool_batch
+    /// Consume the pending tool calls exactly once.
+    pub fn take_pending_tool_calls(&mut self) -> Result<Vec<ToolCall>, CoreError> {
+        self.pending_tool_calls
             .take()
-            .ok_or_else(|| CoreError::Internal("no pending tool batch".into()))
+            .ok_or_else(|| CoreError::Internal("no pending tool calls".into()))
     }
 
     /// Begin the model iteration identified by [`TurnContext::iteration`].
@@ -231,38 +223,23 @@ impl<'a> TurnContext<'a> {
                 "agent requested more than {max_calls} model calls"
             )));
         }
-        if self.open_iteration.is_some() {
+        if self.model_iteration_started {
             return Err(CoreError::Internal(
-                "a model iteration is already open".into(),
+                "a model iteration has already started".into(),
             ));
         }
-        self.open_iteration = Some(self.iteration);
-        self.open_usage = None;
+        self.model_iteration_started = true;
         Ok(self.iteration)
     }
 
-    /// Set usage exactly once for the current model iteration.
-    pub fn set_model_usage(&mut self, usage: TokenUsage) -> Result<(), CoreError> {
-        if self.open_iteration.is_none() || self.open_usage.is_some() {
-            return Err(CoreError::Internal(
-                "model usage has no unique open iteration".into(),
-            ));
+    /// Record the current iteration's completion, add this call's usage to the
+    /// turn total and advance the model-call counter.
+    pub async fn finish_model_iteration(&mut self, usage: TokenUsage) -> Result<(), CoreError> {
+        if !self.model_iteration_started {
+            return Err(CoreError::Internal("no model iteration has started".into()));
         }
-        self.open_usage = Some(usage);
-        Ok(())
-    }
-
-    /// Record the current iteration's completion, add its usage once and
-    /// advance the model-call counter.
-    pub async fn finish_model_iteration(&mut self) -> Result<(), CoreError> {
-        let iteration = self
-            .open_iteration
-            .take()
-            .ok_or_else(|| CoreError::Internal("no model iteration is open".into()))?;
-        let usage = self
-            .open_usage
-            .take()
-            .ok_or_else(|| CoreError::Internal("open model iteration has no usage".into()))?;
+        self.model_iteration_started = false;
+        let iteration = self.iteration;
         self.recorder
             .record(EventMsg::ModelRequestCompleted(
                 ModelRequestCompletedEvent { iteration, usage },
@@ -512,6 +489,7 @@ pub trait Agent: Send + Sync {
     /// it does run model, tool, and step hooks.
     async fn forward(&mut self, ctx: &mut TurnContext<'_>) -> Result<TurnOutcome, CoreError> {
         let mut step = ctx.initial_step.clone();
+        let mut call_usage: Option<TokenUsage> = None;
 
         loop {
             match step {
@@ -525,7 +503,7 @@ pub trait Agent: Send + Sync {
                     });
                 }
                 TurnStep::CallTool => {
-                    let calls = ctx.take_tool_batch()?;
+                    let calls = ctx.take_pending_tool_calls()?;
                     let results = self.acting_with_hooks(ctx, calls).await?;
                     let next_iteration = ctx.iteration().checked_add(1);
                     let next = match next_iteration {
@@ -544,7 +522,10 @@ pub trait Agent: Send + Sync {
                     let mut next = next;
                     self.schedule_after_step(ctx, StepOutput::Tools(&results), &mut next)
                         .await?;
-                    ctx.finish_model_iteration().await?;
+                    let usage = call_usage.take().ok_or_else(|| {
+                        CoreError::Internal("no model usage for the open iteration".into())
+                    })?;
+                    ctx.finish_model_iteration(usage).await?;
                     ctx.flush_reminders().await?;
                     step = next;
                 }
@@ -557,7 +538,7 @@ pub trait Agent: Send + Sync {
                     let iteration = ctx.begin_model_iteration()?;
                     let ReasoningOutput { response, streamed } =
                         self.reasoning_with_hooks(ctx, allow_tools).await?;
-                    ctx.set_model_usage(response.usage)?;
+                    call_usage = Some(response.usage);
                     let content = response
                         .content
                         .clone()
@@ -569,7 +550,7 @@ pub trait Agent: Send + Sync {
                     };
                     let ignored = response.tool_calls.len().saturating_sub(calls.len());
                     if !calls.is_empty() {
-                        ctx.set_tool_batch(calls.clone())?;
+                        ctx.set_pending_tool_calls(calls.clone())?;
                     }
 
                     let default_next = if !calls.is_empty() {
@@ -592,8 +573,8 @@ pub trait Agent: Send + Sync {
                     let retained_calls = if execute_batch {
                         calls.clone()
                     } else {
-                        if ctx.has_tool_batch() {
-                            let _ = ctx.take_tool_batch()?;
+                        if ctx.has_pending_tool_calls() {
+                            let _ = ctx.take_pending_tool_calls()?;
                         }
                         Vec::new()
                     };
@@ -608,7 +589,10 @@ pub trait Agent: Send + Sync {
                             .await?;
                     }
                     if !execute_batch {
-                        ctx.finish_model_iteration().await?;
+                        let usage = call_usage.take().ok_or_else(|| {
+                            CoreError::Internal("no model usage for the open iteration".into())
+                        })?;
+                        ctx.finish_model_iteration(usage).await?;
                         ctx.flush_reminders().await?;
                     }
                     step = next;
@@ -666,17 +650,17 @@ pub trait Agent: Send + Sync {
                 locked_done = Some(next.clone());
             }
         }
+        let next_model_iteration = if ctx.model_iteration_started {
+            ctx.iteration().checked_add(1).unwrap_or(u32::MAX)
+        } else {
+            ctx.iteration()
+        };
         match next {
-            TurnStep::CallTool if !ctx.has_tool_batch() => Err(CoreError::Internal(
-                "agent selected CallTool without a pending tool batch".into(),
+            TurnStep::CallTool if !ctx.has_pending_tool_calls() => Err(CoreError::Internal(
+                "agent selected CallTool without pending tool calls".into(),
             )),
             TurnStep::CallModel { allow_tools }
-                if *allow_tools
-                    && ctx
-                        .open_iteration
-                        .and_then(|iteration| iteration.checked_add(1))
-                        .unwrap_or(ctx.iteration())
-                        >= ctx.config.max_tool_iterations =>
+                if *allow_tools && next_model_iteration >= ctx.config.max_tool_iterations =>
             {
                 Err(CoreError::Internal(
                     "agent enabled tools after the tool iteration budget".into(),
@@ -703,7 +687,7 @@ mod tests {
     use crate::tool::ToolRegistry;
 
     #[test]
-    fn context_consumes_initial_plan_and_batches_once() {
+    fn context_consumes_initial_plan_and_pending_tool_calls_once() {
         let store = Arc::new(InMemoryEventStore::new());
         let clock = Arc::new(FixedClock::new("2026-11-23", "UTC"));
         let mut recorder = Recorder::new(store, clock, ThreadId::new());
@@ -721,15 +705,15 @@ mod tests {
             "echo",
             serde_json::Value::Null,
         )];
-        ctx.set_tool_batch(calls.clone()).unwrap();
-        assert!(ctx.set_tool_batch(Vec::new()).is_err());
-        assert_eq!(ctx.take_tool_batch().unwrap(), calls);
-        assert!(ctx.take_tool_batch().is_err());
+        ctx.set_pending_tool_calls(calls.clone()).unwrap();
+        assert!(ctx.set_pending_tool_calls(Vec::new()).is_err());
+        assert_eq!(ctx.take_pending_tool_calls().unwrap(), calls);
+        assert!(ctx.take_pending_tool_calls().is_err());
 
         let other = TurnContext::new(&mut recorder, &config, TurnId::new());
         assert_eq!(other.iteration(), 0);
         assert_eq!(other.usage(), TokenUsage::default());
-        assert!(!other.has_tool_batch());
+        assert!(!other.has_pending_tool_calls());
     }
 
     #[tokio::test]
@@ -791,8 +775,9 @@ mod tests {
         ctx.model_calls = u64::from(u32::MAX);
 
         assert_eq!(ctx.begin_model_iteration().unwrap(), u32::MAX);
-        ctx.set_model_usage(TokenUsage::default()).unwrap();
-        ctx.finish_model_iteration().await.unwrap();
+        ctx.finish_model_iteration(TokenUsage::default())
+            .await
+            .unwrap();
 
         assert_eq!(ctx.model_calls(), u64::from(u32::MAX) + 1);
         assert_eq!(ctx.iteration(), u32::MAX);

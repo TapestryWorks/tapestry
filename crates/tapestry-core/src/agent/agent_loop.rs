@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_step_can_finish_after_a_complete_ordered_tool_batch() {
+    async fn after_step_can_finish_after_ordered_tool_calls() {
         let calls = vec![
             tc("echo", serde_json::json!({"input":"first"})),
             tc("echo", serde_json::json!({"input":"second"})),
@@ -2277,7 +2277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_and_its_tool_batch_share_one_iteration_number() {
+    async fn model_and_its_tool_calls_share_one_iteration_number() {
         let model = ScriptedModel::new(vec![
             resp(None, vec![tc("echo", serde_json::json!({"input":"one"}))]),
             resp(Some("done"), vec![]),
@@ -2409,7 +2409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_call_tool_without_a_batch_is_an_error() {
+    async fn initial_call_tool_without_pending_tool_calls_is_an_error() {
         let model = ScriptedModel::new(vec![]);
         let mut h = Harness::without_time(model.clone(), &ThreadConfig::default());
         let mut probe = Probe::new("initial", Arc::new(Mutex::new(Vec::new())));
@@ -2419,7 +2419,7 @@ mod tests {
         let (result, events, _) = h.turn("go").await;
 
         assert!(
-            matches!(result, Err(CoreError::Internal(message)) if message.contains("pending tool batch"))
+            matches!(result, Err(CoreError::Internal(message)) if message.contains("pending tool calls"))
         );
         assert!(model.requests.lock().unwrap().is_empty());
         assert!(!events
