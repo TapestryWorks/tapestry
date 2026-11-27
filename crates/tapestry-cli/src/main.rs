@@ -7,10 +7,7 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use tapestry_adapter_cli::{CliEventAdapter, CliOutput};
-use tapestry_core::{
-    BuiltinToolsConfig, EventSubscription, GenaiProviderConfig, OpenAiChatModel, TapestryThread,
-    ToolRegistry,
-};
+use tapestry_core::{EventSubscription, GenaiProviderConfig, OpenAiChatModel, TapestryThread};
 use tapestry_protocol::{Command, EventAdapter, EventMsg, SubmissionId, ThreadSettings};
 
 #[derive(Parser)]
@@ -42,10 +39,10 @@ async fn run(args: Args) -> Result<()> {
     ensure!(!args.prompt.trim().is_empty(), "prompt must not be empty");
     let cwd = std::env::current_dir().context("determine current working directory")?;
     let home = std::env::home_dir();
-    let (provider, system_prompt) = config::load(&cwd, home.as_deref(), args.agent.as_deref())?;
+    let (provider, agent_config) = config::load(&cwd, home.as_deref(), args.agent.as_deref())?;
     run_turn(
         provider,
-        system_prompt,
+        agent_config,
         args.prompt,
         &cwd,
         &mut io::stdout().lock(),
@@ -55,14 +52,13 @@ async fn run(args: Args) -> Result<()> {
 
 async fn run_turn(
     provider: GenaiProviderConfig,
-    system_prompt: String,
+    agent_config: config::AgentConfig,
     prompt: String,
     cwd: &std::path::Path,
     output: &mut impl Write,
 ) -> Result<()> {
     let client = OpenAiChatModel::from_config(&provider).context("initialize chat model")?;
-    let mut tools = ToolRegistry::new();
-    BuiltinToolsConfig::all(cwd).register(&mut tools);
+    let tools = agent_config.tools(cwd);
     let (_thread, handle) = TapestryThread::spawn(Arc::new(client), Arc::new(tools));
     let mut events = handle.subscribe(0).await?;
     let mut adapter = CliEventAdapter::new();
@@ -71,7 +67,7 @@ async fn run_turn(
         .submit(Command::UpdateSettings {
             settings: ThreadSettings {
                 model: Some(provider.model),
-                system_prompt: Some(system_prompt),
+                system_prompt: Some(agent_config.system_prompt),
                 ..Default::default()
             },
         })
@@ -154,6 +150,23 @@ mod tests {
         expected_system_prompt: &'static str,
         responses: Vec<String>,
     ) -> (Result<()>, Vec<String>) {
+        run_with_tool_config(
+            extra_args,
+            expected_system_prompt,
+            responses,
+            "",
+            &["read_file", "shell", "write_file"],
+        )
+        .await
+    }
+
+    async fn run_with_tool_config(
+        extra_args: &[&str],
+        expected_system_prompt: &str,
+        responses: Vec<String>,
+        tool_config: &str,
+        expected_tools: &[&str],
+    ) -> (Result<()>, Vec<String>) {
         let args = Args::try_parse_from(
             ["tapestry-cli", "-p", "review this"]
                 .into_iter()
@@ -174,28 +187,23 @@ mod tests {
         .unwrap();
         std::fs::write(
             config_dir.join("agents/reviewer.yaml"),
-            "system_prompt: act as a reviewer",
+            format!("system_prompt: act as a reviewer\n{tool_config}"),
         )
         .unwrap();
-        let (provider, system_prompt) =
+        let (provider, agent_config) =
             config::load(cwd.path(), None, args.agent.as_deref()).unwrap();
         let mut output = Vec::new();
 
         let (result, ()) = timeout(Duration::from_secs(10), async {
             tokio::join!(
-                run_turn(
-                    provider,
-                    system_prompt,
-                    args.prompt,
-                    cwd.path(),
-                    &mut output
-                ),
-                serve_completion(listener, responses, expected_system_prompt)
+                run_turn(provider, agent_config, args.prompt, cwd.path(), &mut output),
+                serve_completion(listener, responses, expected_system_prompt, expected_tools)
             )
         })
         .await
         .unwrap();
 
+        assert!(!cwd.path().join("denied-marker").exists());
         let events = String::from_utf8(output)
             .unwrap()
             .lines()
@@ -325,6 +333,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_allow_tools_controls_advertisement_and_execution() {
+        for (config, expected_tools, read_status) in [
+            ("allow_tools: []", vec![], "not found"),
+            ("allow_tools: [read_file]", vec!["read_file"], "failed"),
+        ] {
+            let mut responses = Vec::new();
+            for (name, args) in [
+                ("read_file", serde_json::json!({"path": "missing-file"})),
+                (
+                    "write_file",
+                    serde_json::json!({"path": "denied-marker", "content": "forbidden"}),
+                ),
+                (
+                    "shell",
+                    serde_json::json!({"command": "echo forbidden > denied-marker"}),
+                ),
+            ] {
+                let chunk = serde_json::json!({"choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "id": format!("call_{name}"), "type": "function",
+                        "function": {"name": name, "arguments": args.to_string()}}]
+                }, "finish_reason": null}]});
+                responses.push(http("200 OK", "text/event-stream", &format!(
+                    "data: {chunk}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+                )));
+            }
+            responses.push(http("200 OK", "text/event-stream", concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )));
+            let (result, events) = run_with_tool_config(
+                &["-a", "reviewer"],
+                "act as a reviewer",
+                responses,
+                config,
+                &expected_tools,
+            )
+            .await;
+            result.unwrap();
+            assert_eq!(events.len(), 7, "{events:?}");
+            assert!(
+                events[1].starts_with(&format!("tool result: read_file ({read_status}):")),
+                "{events:?}"
+            );
+            assert!(
+                events[3].starts_with("tool result: write_file (not found):"),
+                "{events:?}"
+            );
+            assert!(
+                events[5].starts_with("tool result: shell (not found):"),
+                "{events:?}"
+            );
+            assert_eq!(events[6], "done");
+        }
+    }
+
+    #[tokio::test]
     async fn model_errors_fail_the_command_with_the_error_message() {
         let (result, events) = run_against(vec![http(
             "400 Bad Request",
@@ -342,6 +407,7 @@ mod tests {
         listener: TcpListener,
         responses: Vec<String>,
         expected_system_prompt: &str,
+        expected_tools: &[&str],
     ) {
         for http in responses {
             let (socket, _) = listener.accept().await.unwrap();
@@ -372,11 +438,11 @@ mod tests {
             assert_eq!(payload["stream"], true);
             let names: Vec<_> = payload["tools"]
                 .as_array()
-                .unwrap()
-                .iter()
+                .into_iter()
+                .flatten()
                 .map(|tool| tool["function"]["name"].as_str().unwrap())
                 .collect();
-            assert_eq!(names, ["read_file", "shell", "write_file"]);
+            assert_eq!(names, expected_tools);
             let messages = payload["messages"].as_array().unwrap();
             assert!(messages.iter().any(|message| {
                 message["role"] == "system" && message["content"] == expected_system_prompt

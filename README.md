@@ -62,7 +62,16 @@ built-in system prompt `You are a helpful assistant.`
 ```yaml
 system_prompt: |
   You are a code reviewer. Describe any correctness issues you find.
+allow_tools: [read_file]
 ```
+
+`allow_tools` is an optional list of tool names in the selected agent template.
+Omitting it enables all three built-in tools (`read_file`, `write_file`, `shell`),
+including when no `-a` is supplied. An explicit empty list (`allow_tools: []`)
+disables all tools. A nonempty list enables only those tools; duplicates are
+ignored. Unknown names, null, and non-list values fail configuration loading.
+Excluded tools are not advertised to the model or registered for execution,
+even if the model requests them.
 
 The CLI checks configuration files in this order: working-directory
 `.tapestry`, working-directory `.agents`, home-directory `.tapestry`, then
@@ -260,7 +269,8 @@ Architecture reference: [OpenAI Codex](https://github.com/openai/codex) (`codex-
 ## Built-in local tools
 
 `tapestry-cli` enables `read_file`, `write_file`, and `shell` by default, using
-its current working directory. Tool calls and results use the existing agent
+its current working directory, unless the selected agent template restricts
+them with `allow_tools`. Tool calls and results use the existing agent
 loop and event stream.
 
 | Tool | Arguments | Behavior |

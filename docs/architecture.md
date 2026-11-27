@@ -355,7 +355,10 @@ cargo fmt --all -- --check
 `tapestry-core::builtin_tools` implements `ReadFileTool`, `WriteFileTool`, and
 `ShellTool` through the existing `Tool` contract. `BuiltinToolsConfig` selects
 individual tools; its default enables none and `all(directory)` enables all
-three. The CLI explicitly registers all three against its working directory.
+three. The CLI registers all three against its working directory by default.
+An agent template can supply `allow_tools` to register only the named tools;
+an empty list registers none. Unknown names and invalid list values are rejected
+at configuration load time. Only registered tools are advertised and executable.
 Library registries remain empty unless the caller registers tools. No protocol,
 event ordering, or agent scheduling changes are required. Local tools use host
 permissions rather than a sandbox; Shell captures bounded stdout/stderr and
