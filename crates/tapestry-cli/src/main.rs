@@ -8,7 +8,8 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use tapestry_adapter_cli::{CliEventAdapter, CliOutput};
 use tapestry_core::{
-    EventSubscription, GenaiProviderConfig, OpenAiChatModel, TapestryThread, ToolRegistry,
+    BuiltinToolsConfig, EventSubscription, GenaiProviderConfig, OpenAiChatModel, TapestryThread,
+    ToolRegistry,
 };
 use tapestry_protocol::{Command, EventAdapter, EventMsg, SubmissionId, ThreadSettings};
 
@@ -46,6 +47,7 @@ async fn run(args: Args) -> Result<()> {
         provider,
         system_prompt,
         args.prompt,
+        &cwd,
         &mut io::stdout().lock(),
     )
     .await
@@ -55,10 +57,13 @@ async fn run_turn(
     provider: GenaiProviderConfig,
     system_prompt: String,
     prompt: String,
+    cwd: &std::path::Path,
     output: &mut impl Write,
 ) -> Result<()> {
     let client = OpenAiChatModel::from_config(&provider).context("initialize chat model")?;
-    let (_thread, handle) = TapestryThread::spawn(Arc::new(client), Arc::new(ToolRegistry::new()));
+    let mut tools = ToolRegistry::new();
+    BuiltinToolsConfig::all(cwd).register(&mut tools);
+    let (_thread, handle) = TapestryThread::spawn(Arc::new(client), Arc::new(tools));
     let mut events = handle.subscribe(0).await?;
     let mut adapter = CliEventAdapter::new();
 
@@ -178,7 +183,13 @@ mod tests {
 
         let (result, ()) = timeout(Duration::from_secs(10), async {
             tokio::join!(
-                run_turn(provider, system_prompt, args.prompt, &mut output),
+                run_turn(
+                    provider,
+                    system_prompt,
+                    args.prompt,
+                    cwd.path(),
+                    &mut output
+                ),
                 serve_completion(listener, responses, expected_system_prompt)
             )
         })
@@ -260,6 +271,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executes_a_builtin_shell_tool_by_default() {
+        let tool_call = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"echo builtin-ok\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let answer = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (result, events) = run_against(vec![
+            http("200 OK", "text/event-stream", tool_call),
+            http("200 OK", "text/event-stream", answer),
+        ])
+        .await;
+        result.unwrap();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events[0].starts_with("tool call: shell("));
+        assert!(events[1].starts_with("tool result: shell: "), "{events:?}");
+        assert!(events[1].contains("builtin-ok"));
+        assert_eq!(events[2], "done");
+    }
+
+    #[tokio::test]
+    async fn builtin_files_write_then_read_in_the_cli_working_directory() {
+        fn tool_response(name: &str, arguments: Value) -> String {
+            let chunk = serde_json::json!({"choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "id": format!("call_{name}"),
+                    "type": "function", "function": {
+                        "name": name, "arguments": arguments.to_string()
+                    }}]
+            }, "finish_reason": null}]});
+            http("200 OK", "text/event-stream", &format!(
+                "data: {chunk}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            ))
+        }
+        let (result, events) = run_against(vec![
+            tool_response("write_file", serde_json::json!({"path": "created.txt", "content": "hello files"})),
+            tool_response("read_file", serde_json::json!({"path": "created.txt"})),
+            http("200 OK", "text/event-stream", concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )),
+        ]).await;
+        result.unwrap();
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert!(events[1].starts_with("tool result: write_file: Wrote 11 bytes"));
+        assert_eq!(events[3], "tool result: read_file: hello files");
+        assert_eq!(events[4], "done");
+    }
+
+    #[tokio::test]
     async fn model_errors_fail_the_command_with_the_error_message() {
         let (result, events) = run_against(vec![http(
             "400 Bad Request",
@@ -305,6 +370,13 @@ mod tests {
             let payload: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(payload["model"], "test-model");
             assert_eq!(payload["stream"], true);
+            let names: Vec<_> = payload["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["read_file", "shell", "write_file"]);
             let messages = payload["messages"].as_array().unwrap();
             assert!(messages.iter().any(|message| {
                 message["role"] == "system" && message["content"] == expected_system_prompt

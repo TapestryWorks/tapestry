@@ -101,7 +101,7 @@ Repair happens only in the projection (no compensating events): when a turn is c
 | provider integrations | `tapestry-core::model::genai` | Provider configuration, request/response mapping, and the genai-backed `GenaiModelClient` |
 | prompt rendering | `tapestry-core::formatter::utils` | `render_user`, `render_environment_context`, `render_system_reminder` |
 | config / session settings | `tapestry-core::config` + `ThreadSettings` | Sparse overrides |
-| tool execution | `tapestry-core::tool`, `tapestry-protocol::tool` | `Tool` trait, `ToolRegistry`; `ToolSpec`, `ToolCall`, `ToolResult` (protocol) |
+| tool execution | `tapestry-core::tool`, `tapestry-core::builtin_tools`, `tapestry-protocol::tool` | `Tool` trait, `ToolRegistry`; `ToolSpec`, `ToolCall`, `ToolResult` (protocol) |
 
 `formatter::Formatter` provides default event-stream folding (`events_to_items`) into `ConversationItem`s via `ConversationProjection`, then default conversion into `genai::chat::ChatMessage`s; `format` invokes the two stages in order. Implementors can override either stage. The default message view maps every projected item in order, with no position-based reminder filtering. Unfinished tool calls are repaired when a turn ends; the synthetic results are appended to the items, ahead of the pending reminders. `OpenAiFormatter` uses these defaults. Shared text rendering helpers live in `formatter::utils`; `formatter::prompt` remains a compatibility re-export. `ModelRequest.events` is a complete ordered snapshot read from the event store after `ModelRequestStarted` and every reminder queued for this request have been appended. `GenaiModelClient` owns an `Arc<dyn Formatter>` and uses it for both streaming and non-streaming requests; OpenAI Chat and Responses models expose `with_formatter` and default to `OpenAiFormatter`. The public `model_request_to_chat_request` helper uses that default strategy. `model::chat_model` and `model::response_model` each group a trait with its mock and a concrete OpenAI client. `OpenAiChatModel` pins Chat Completions; `OpenAiResponseModel` pins the Responses API and sends the local event snapshot on each request. The traits share the normalized protocol types and `ModelStream`. `AgentLoop` uses `ChatModel`; the response interface is not wired into the agent loop. `ModelClient` and `MockModelClient` remain compatibility aliases for `ChatModel` and `MockChatModel`.
 
@@ -349,3 +349,15 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+### Built-in local tools
+
+`tapestry-core::builtin_tools` implements `ReadFileTool`, `WriteFileTool`, and
+`ShellTool` through the existing `Tool` contract. `BuiltinToolsConfig` selects
+individual tools; its default enables none and `all(directory)` enables all
+three. The CLI explicitly registers all three against its working directory.
+Library registries remain empty unless the caller registers tools. No protocol,
+event ordering, or agent scheduling changes are required. Local tools use host
+permissions rather than a sandbox; Shell captures bounded stdout/stderr and
+applies a timeout, with direct-child kill-on-drop. Descendant process isolation
+is not provided.
