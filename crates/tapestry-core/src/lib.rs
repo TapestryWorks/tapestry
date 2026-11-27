@@ -3,6 +3,7 @@
 //! Architecture is informed by OpenAI Codex `codex-core`; see `docs/architecture.md`.
 
 pub mod agent;
+pub mod builtin_tools;
 pub mod clock;
 pub mod config;
 pub mod context;
@@ -22,6 +23,7 @@ pub use agent::{
     Agent, AgentDeps, AgentFactory, ReactAgent, ReasoningOutput, StepOutput, StreamedMessage,
     TurnContext, TurnOutcome, TurnStep,
 };
+pub use builtin_tools::{BuiltinToolsConfig, ReadFileTool, ShellTool, WriteFileTool};
 pub use clock::{Clock, ClockError, ClockReading, FixedClock, SystemClock};
 pub use config::ThreadConfig;
 pub use error::CoreError;

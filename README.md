@@ -62,7 +62,16 @@ built-in system prompt `You are a helpful assistant.`
 ```yaml
 system_prompt: |
   You are a code reviewer. Describe any correctness issues you find.
+allow_tools: [read_file]
 ```
+
+`allow_tools` is an optional list of tool names in the selected agent template.
+Omitting it enables all three built-in tools (`read_file`, `write_file`, `shell`),
+including when no `-a` is supplied. An explicit empty list (`allow_tools: []`)
+disables all tools. A nonempty list enables only those tools; duplicates are
+ignored. Unknown names, null, and non-list values fail configuration loading.
+Excluded tools are not advertised to the model or registered for execution,
+even if the model requests them.
 
 The CLI checks configuration files in this order: working-directory
 `.tapestry`, working-directory `.agents`, home-directory `.tapestry`, then
@@ -256,3 +265,46 @@ cargo test --workspace
 Apache-2.0 — see [LICENSE](LICENSE).
 
 Architecture reference: [OpenAI Codex](https://github.com/openai/codex) (`codex-rs/core`, `codex-rs/protocol`).
+
+## Built-in local tools
+
+`tapestry-cli` enables `read_file`, `write_file`, and `shell` by default, using
+its current working directory, unless the selected agent template restricts
+them with `allow_tools`. Tool calls and results use the existing agent
+loop and event stream.
+
+| Tool | Arguments | Behavior |
+| --- | --- | --- |
+| `read_file` | `path` | Read a UTF-8 file, up to 1 MiB; larger or non-UTF-8 files fail. |
+| `write_file` | `path`, `content` | Create or overwrite a UTF-8 file; parent directories must exist. |
+| `shell` | `command`, optional `timeout_ms` | Run `sh -c` (Unix) or `cmd /D /S /C` (Windows); default 30 seconds, range 1–300,000 ms. |
+
+The registry also adds the standard `description` argument explaining why a tool
+is called. Shell output is JSON with `stdout`, `stderr`, `exit_code`,
+`stdout_truncated`, and `stderr_truncated`; each stream retains at most 1 MiB.
+Nonzero exits, invalid arguments, IO errors, and timeouts return failed tool
+results so the model can respond to them. Standard input is closed.
+
+Library users retain an empty `ToolRegistry::new()` by default. Enable only the
+needed capabilities, or use `BuiltinToolsConfig::all(working_directory)`:
+
+```rust
+use tapestry_core::{BuiltinToolsConfig, ToolRegistry};
+
+let mut tools = ToolRegistry::new();
+BuiltinToolsConfig {
+    working_directory: std::env::current_dir().expect("working directory"),
+    read_file: true,
+    write_file: false,
+    shell: false,
+}.register(&mut tools);
+```
+
+`ReadFileTool`, `WriteFileTool`, and `ShellTool` are also exported for individual
+registration with `Arc::new(ToolType::new(working_directory))` alongside custom
+tools. File tools accept only regular files (including symlinks to regular files);
+directories, named pipes, sockets, and devices are rejected.
+Relative file paths are resolved against that directory; absolute paths
+and parent traversal are supported. The working directory is not a sandbox:
+these tools use the host process's permissions. Shell timeout/cancellation kills
+the direct child, but does not guarantee termination of descendant processes.
