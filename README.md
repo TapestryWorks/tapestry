@@ -302,7 +302,9 @@ BuiltinToolsConfig {
 
 `ReadFileTool`, `WriteFileTool`, and `ShellTool` are also exported for individual
 registration with `Arc::new(ToolType::new(working_directory))` alongside custom
-tools. Relative file paths are resolved against that directory; absolute paths
+tools. File tools accept only regular files (including symlinks to regular files);
+directories, named pipes, sockets, and devices are rejected.
+Relative file paths are resolved against that directory; absolute paths
 and parent traversal are supported. The working directory is not a sandbox:
 these tools use the host process's permissions. Shell timeout/cancellation kills
 the direct child, but does not guarantee termination of descendant processes.

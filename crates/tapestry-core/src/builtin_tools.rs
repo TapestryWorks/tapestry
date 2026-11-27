@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use tapestry_protocol::{ToolCall, ToolResult, ToolSpec};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::{Tool, ToolRegistry};
 
@@ -64,6 +64,32 @@ fn file_path(base: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(base.join(path))
 }
 
+// Follow symlinks, but only operate on regular files. Check before opening to
+// avoid opening devices, and check the opened handle again before any IO.
+async fn open_regular_file(path: &Path, write: bool) -> Result<tokio::fs::File, String> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if !metadata.is_file() => return Err("path must be a regular file".into()),
+        Ok(_) => {}
+        Err(error) if write && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(!write).write(write).create(write);
+    // A path can be replaced by a FIFO between metadata and open. Nonblocking
+    // open prevents that race from stranding a Tokio blocking-pool worker.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).await.map_err(|e| e.to_string())?;
+    if !file.metadata().await.map_err(|e| e.to_string())?.is_file() {
+        return Err("path must be a regular file".into());
+    }
+    // Never truncate until the opened handle has passed validation.
+    if write {
+        file.set_len(0).await.map_err(|e| e.to_string())?;
+    }
+    Ok(file)
+}
+
 fn result(call: &ToolCall, output: Result<String, String>) -> ToolResult {
     match output {
         Ok(output) => ToolResult::completed(call, output),
@@ -112,9 +138,7 @@ impl Tool for ReadFileTool {
                 let args: ReadArgs =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
                 let path = file_path(&self.working_directory, &args.path)?;
-                let file = tokio::fs::File::open(path)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let file = open_regular_file(&path, false).await?;
                 let mut bytes = Vec::new();
                 file.take((MAX_BYTES + 1) as u64)
                     .read_to_end(&mut bytes)
@@ -173,9 +197,11 @@ impl Tool for WriteFileTool {
                 let args: WriteArgs =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
                 let path = file_path(&self.working_directory, &args.path)?;
-                tokio::fs::write(path, args.content.as_bytes())
+                let mut file = open_regular_file(&path, true).await?;
+                file.write_all(args.content.as_bytes())
                     .await
                     .map_err(|e| e.to_string())?;
+                file.flush().await.map_err(|e| e.to_string())?;
                 Ok(format!(
                     "Wrote {} bytes to {}",
                     args.content.len(),
@@ -386,6 +412,78 @@ mod tests {
                 ToolCallStatus::Failed
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_tools_reject_special_files_without_waiting_for_a_peer() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        symlink(&fifo, dir.path().join("fifo-link")).unwrap();
+        let tools: [Box<dyn Tool>; 2] = [
+            Box::new(ReadFileTool::new(dir.path())),
+            Box::new(WriteFileTool::new(dir.path())),
+        ];
+        for tool in tools {
+            for path in ["fifo", "fifo-link", ".", "/dev/null"] {
+                let request = call(tool.name(), json!({"path": path, "content": "test"}));
+                let result =
+                    tokio::time::timeout(Duration::from_secs(1), tool.execute(&request)).await;
+                // If this regresses, release a blocked FIFO open/read before
+                // asserting so Tokio runtime shutdown cannot hang the test.
+                if result.is_err() && matches!(path, "fifo" | "fifo-link") {
+                    let peer = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&fifo)
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    drop(peer);
+                }
+                let result = result.expect("special file must be rejected without blocking");
+                assert_eq!(result.status, ToolCallStatus::Failed, "{path}");
+                assert!(result.output.contains("regular file"), "{}", result.output);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_tools_preserve_regular_file_symlink_behavior() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target"), "long original content").unwrap();
+        symlink("target", dir.path().join("link")).unwrap();
+        let write = WriteFileTool::new(dir.path());
+        let read = ReadFileTool::new(dir.path());
+        let result = write
+            .execute(&call(
+                "write_file",
+                json!({"path": "link", "content": "new"}),
+            ))
+            .await;
+        assert_eq!(result.status, ToolCallStatus::Completed);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target")).unwrap(),
+            "new"
+        );
+        let result = read
+            .execute(&call("read_file", json!({"path": "link"})))
+            .await;
+        assert_eq!(result.status, ToolCallStatus::Completed);
+        assert_eq!(result.output, "new");
+        assert!(std::fs::symlink_metadata(dir.path().join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]

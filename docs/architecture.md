@@ -361,6 +361,9 @@ an empty list registers none. Unknown names and invalid list values are rejected
 at configuration load time. Only registered tools are advertised and executable.
 Library registries remain empty unless the caller registers tools. No protocol,
 event ordering, or agent scheduling changes are required. Local tools use host
-permissions rather than a sandbox; Shell captures bounded stdout/stderr and
+permissions rather than a sandbox. File tools validate regular-file metadata
+before opening and on the opened handle, and truncate only after validation.
+Unix opens use `O_NONBLOCK` to prevent FIFO replacement races from blocking.
+Shell captures bounded stdout/stderr and
 applies a timeout, with direct-child kill-on-drop. Descendant process isolation
 is not provided.
